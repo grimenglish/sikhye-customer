@@ -399,7 +399,18 @@ def to_excel_bytes(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31])
+            safe_df = df.copy()
+            # Excel은 timezone-aware datetime을 저장하지 못하므로 timezone 제거
+            for col in safe_df.columns:
+                if pd.api.types.is_datetime64_any_dtype(safe_df[col]):
+                    try:
+                        safe_df[col] = safe_df[col].dt.tz_localize(None)
+                    except Exception:
+                        safe_df[col] = pd.to_datetime(safe_df[col], errors="coerce", utc=True).dt.tz_localize(None)
+                elif safe_df[col].dtype == "object":
+                    # 문자열 안에 섞인 UTC datetime도 안전하게 문자열 처리
+                    safe_df[col] = safe_df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else x)
+            safe_df.to_excel(writer, index=False, sheet_name=name[:31])
     output.seek(0)
     return output.getvalue()
 
