@@ -1,7 +1,7 @@
 
-import re
 import io
-from datetime import datetime
+import re
+from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
@@ -11,9 +11,14 @@ try:
 except Exception:
     msoffcrypto = None
 
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
 
 st.set_page_config(
-    page_title="식혜명가 고객 재구매 CRM",
+    page_title="식혜명가 저장형 고객 CRM",
     page_icon="📦",
     layout="wide",
 )
@@ -35,7 +40,12 @@ st.markdown("""
     border:1px solid #e5e7eb;
     padding:14px 16px;
     border-radius:12px;
-    color:#333;
+}
+.warn {
+    background:#fff7ed;
+    border:1px solid #fed7aa;
+    padding:14px 16px;
+    border-radius:12px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -43,6 +53,28 @@ st.markdown("""
 SMARTSTORE_PASSWORD = "1111"
 
 
+# =========================
+# Supabase 연결
+# =========================
+def get_supabase():
+    if create_client is None:
+        return None
+
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_KEY", "")
+
+    if not url or not key:
+        return None
+
+    return create_client(url, key)
+
+
+sb = get_supabase()
+
+
+# =========================
+# 유틸
+# =========================
 def normalize_phone(x):
     if pd.isna(x):
         return ""
@@ -65,24 +97,35 @@ def normalize_address(x):
 def pick_col(df, candidates):
     cols = list(df.columns)
     exact = {str(c).strip(): c for c in cols}
+
     for c in candidates:
         if c in exact:
             return exact[c]
+
     for col in cols:
         col_s = str(col).strip()
         for c in candidates:
             if c in col_s:
                 return col
+
     return None
+
+
+def safe_series(df, col, default=""):
+    if col and col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
 
 
 def read_excel_file(uploaded_file):
     raw = uploaded_file.getvalue()
+
     try:
         return pd.read_excel(io.BytesIO(raw))
     except Exception as first_error:
         if msoffcrypto is None:
             raise RuntimeError("암호화 엑셀을 읽으려면 requirements.txt 최신본이 필요합니다.")
+
         try:
             office = msoffcrypto.OfficeFile(io.BytesIO(raw))
             office.load_key(password=SMARTSTORE_PASSWORD)
@@ -97,6 +140,7 @@ def read_excel_file(uploaded_file):
 def detect_market(filename, df):
     name = filename.lower()
     cols = set(map(str, df.columns))
+
     if "delivery" in name or "coupang" in name or "쿠팡" in name:
         return "쿠팡"
     if "스마트스토어" in name or "smartstore" in name or "naver" in name or "네이버" in name:
@@ -105,13 +149,8 @@ def detect_market(filename, df):
         return "쿠팡"
     if "상품주문번호" in cols or "통합배송지" in cols or "수취인연락처1" in cols:
         return "네이버"
+
     return "기타"
-
-
-def safe_series(df, col, default=""):
-    if col and col in df.columns:
-        return df[col]
-    return pd.Series([default] * len(df), index=df.index)
 
 
 def standardize(df, market, filename):
@@ -147,31 +186,36 @@ def standardize(df, market, filename):
     qty_col = pick_col(df, ["수량", "구매수(수량)", "구매수량"])
 
     out = pd.DataFrame(index=df.index)
-    out["판매채널"] = market
-    out["원본파일"] = filename
+    out["channel"] = market
+    out["source_file"] = filename
 
-    out["주문단위번호"] = safe_series(df, order_unit_col, "").astype(str).str.replace(".0", "", regex=False)
-    out["상품주문번호"] = safe_series(df, product_order_col, "").astype(str).str.replace(".0", "", regex=False)
-    out["주문단위번호"] = out["주문단위번호"].where(out["주문단위번호"].str.strip() != "", out["상품주문번호"])
+    out["order_no"] = safe_series(df, order_unit_col, "").astype(str).str.replace(".0", "", regex=False)
+    out["product_order_no"] = safe_series(df, product_order_col, "").astype(str).str.replace(".0", "", regex=False)
+    out["order_no"] = out["order_no"].where(out["order_no"].str.strip() != "", out["product_order_no"])
 
-    out["주문일"] = pd.to_datetime(safe_series(df, order_date_col, pd.NaT), errors="coerce")
-    out["수취인"] = safe_series(df, receiver_col, "").map(normalize_text)
-    out["수취인전화"] = safe_series(df, receiver_phone_col, "").map(normalize_phone)
-    out["구매자"] = safe_series(df, buyer_col, "").map(normalize_text)
-    out["구매자전화"] = safe_series(df, buyer_phone_col, "").map(normalize_phone)
-    out["주소"] = safe_series(df, address_col, "").map(normalize_address)
-    out["상품명"] = safe_series(df, product_col, "").map(normalize_text)
-    out["수량"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
-    out["결제금액"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
+    out["order_date"] = pd.to_datetime(safe_series(df, order_date_col, pd.NaT), errors="coerce")
+    out["receiver_name"] = safe_series(df, receiver_col, "").map(normalize_text)
+    out["receiver_phone"] = safe_series(df, receiver_phone_col, "").map(normalize_phone)
+    out["buyer_name"] = safe_series(df, buyer_col, "").map(normalize_text)
+    out["buyer_phone"] = safe_series(df, buyer_phone_col, "").map(normalize_phone)
+    out["address"] = safe_series(df, address_col, "").map(normalize_address)
+    out["product_name"] = safe_series(df, product_col, "").map(normalize_text)
+    out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
+    out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
-    name_key = out["수취인"].where(out["수취인"] != "", out["구매자"])
-    phone_key = out["수취인전화"].where(out["수취인전화"] != "", out["구매자전화"])
+    name_key = out["receiver_name"].where(out["receiver_name"] != "", out["buyer_name"])
+    phone_key = out["receiver_phone"].where(out["receiver_phone"] != "", out["buyer_phone"])
 
-    out["고객키"] = name_key.fillna("").astype(str).str.strip() + "|" + out["주소"].fillna("").astype(str).str.strip()
-    out["전화포함고객키"] = name_key.fillna("").astype(str).str.strip() + "|" + phone_key.fillna("").astype(str).str.strip() + "|" + out["주소"].fillna("").astype(str).str.strip()
-    out["주문단위키"] = out["판매채널"] + "|" + out["주문단위번호"].astype(str)
+    out["customer_key"] = name_key.fillna("").astype(str).str.strip() + "|" + out["address"].fillna("").astype(str).str.strip()
+    out["customer_key_strict"] = (
+        name_key.fillna("").astype(str).str.strip()
+        + "|" + phone_key.fillna("").astype(str).str.strip()
+        + "|" + out["address"].fillna("").astype(str).str.strip()
+    )
 
-    out = out[(name_key != "") | (out["주소"] != "") | (phone_key != "")]
+    out["order_key"] = out["channel"] + "|" + out["order_no"].astype(str)
+    out = out[(name_key != "") | (phone_key != "") | (out["address"] != "")]
+    out = out.dropna(subset=["order_date"])
     return out
 
 
@@ -184,7 +228,7 @@ def join_unique(series):
     return ", ".join(vals)
 
 
-def customer_grade(n):
+def grade(n):
     if n >= 5:
         return "VIP"
     if n >= 3:
@@ -192,6 +236,161 @@ def customer_grade(n):
     if n >= 2:
         return "재구매"
     return "신규"
+
+
+def churn(days):
+    if days >= 180:
+        return "장기이탈"
+    if days >= 90:
+        return "이탈위험"
+    if days >= 60:
+        return "관심필요"
+    return "정상"
+
+
+def make_order_level(raw_orders, use_strict=False):
+    key_col = "customer_key_strict" if use_strict else "customer_key"
+
+    grouped = (
+        raw_orders.groupby(["channel", "order_no", "order_key", key_col, "receiver_name", "receiver_phone", "buyer_name", "buyer_phone", "address"], dropna=False)
+        .agg(
+            order_date=("order_date", "min"),
+            product_order_nos=("product_order_no", join_unique),
+            product_names=("product_name", join_unique),
+            total_quantity=("quantity", "sum"),
+            total_amount=("amount", "sum"),
+            source_files=("source_file", join_unique),
+            raw_rows=("product_order_no", "count"),
+        )
+        .reset_index()
+        .rename(columns={key_col: "analysis_customer_key"})
+    )
+    return grouped
+
+
+def make_customer_df(order_level):
+    if order_level.empty:
+        return pd.DataFrame()
+
+    customer = (
+        order_level.groupby("analysis_customer_key", dropna=False)
+        .agg(
+            customer_name=("receiver_name", "first"),
+            phone=("receiver_phone", "first"),
+            address=("address", "first"),
+            order_count=("order_key", pd.Series.nunique),
+            first_order_date=("order_date", "min"),
+            last_order_date=("order_date", "max"),
+            total_amount=("total_amount", "sum"),
+            total_quantity=("total_quantity", "sum"),
+            channels=("channel", join_unique),
+            products=("product_names", join_unique),
+        )
+        .reset_index()
+    )
+
+    today = pd.Timestamp.today().normalize()
+    customer["grade"] = customer["order_count"].apply(grade)
+    customer["customer_type"] = customer["order_count"].apply(lambda x: "재구매" if x >= 2 else "신규")
+    customer["days_since_last_order"] = (today - pd.to_datetime(customer["last_order_date"]).dt.normalize()).dt.days
+    customer["churn_status"] = customer["days_since_last_order"].apply(churn)
+    customer["avg_order_amount"] = (customer["total_amount"] / customer["order_count"]).round(0).astype(int)
+    return customer
+
+
+def fetch_all(table_name):
+    if sb is None:
+        return pd.DataFrame()
+
+    rows = []
+    step = 1000
+    start = 0
+
+    while True:
+        res = sb.table(table_name).select("*").range(start, start + step - 1).execute()
+        data = res.data or []
+        rows.extend(data)
+        if len(data) < step:
+            break
+        start += step
+
+    return pd.DataFrame(rows)
+
+
+def upsert_orders(order_level):
+    if sb is None or order_level.empty:
+        return 0
+
+    records = []
+    now = datetime.now().isoformat(timespec="seconds")
+
+    for _, r in order_level.iterrows():
+        records.append({
+            "order_key": str(r["order_key"]),
+            "channel": str(r["channel"]),
+            "order_no": str(r["order_no"]),
+            "customer_key": str(r["analysis_customer_key"]),
+            "receiver_name": str(r["receiver_name"]),
+            "receiver_phone": str(r["receiver_phone"]),
+            "buyer_name": str(r["buyer_name"]),
+            "buyer_phone": str(r["buyer_phone"]),
+            "address": str(r["address"]),
+            "order_date": pd.to_datetime(r["order_date"]).isoformat(),
+            "product_order_nos": str(r["product_order_nos"]),
+            "product_names": str(r["product_names"]),
+            "total_quantity": int(r["total_quantity"]),
+            "total_amount": int(r["total_amount"]),
+            "source_files": str(r["source_files"]),
+            "raw_rows": int(r["raw_rows"]),
+            "updated_at": now,
+        })
+
+    sb.table("orders").upsert(records, on_conflict="order_key").execute()
+    return len(records)
+
+
+def fetch_orders_as_order_level():
+    df = fetch_all("orders")
+    if df.empty:
+        return df
+
+    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+    df = df.rename(columns={
+        "customer_key": "analysis_customer_key",
+        "receiver_name": "receiver_name",
+        "receiver_phone": "receiver_phone",
+        "buyer_name": "buyer_name",
+        "buyer_phone": "buyer_phone",
+        "address": "address",
+        "product_order_nos": "product_order_nos",
+        "product_names": "product_names",
+        "total_quantity": "total_quantity",
+        "total_amount": "total_amount",
+        "source_files": "source_files",
+        "raw_rows": "raw_rows",
+    })
+    return df
+
+
+def fetch_blacklist():
+    df = fetch_all("blacklist")
+    if df.empty:
+        return pd.DataFrame(columns=["customer_key", "customer_name", "phone", "address", "status", "reason", "memo", "incident_date", "result", "updated_at"])
+    return df
+
+
+def save_blacklist(row):
+    if sb is None:
+        return
+
+    row["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    sb.table("blacklist").upsert([row], on_conflict="customer_key").execute()
+
+
+def delete_blacklist(customer_key):
+    if sb is None:
+        return
+    sb.table("blacklist").delete().eq("customer_key", customer_key).execute()
 
 
 def to_excel_bytes(sheets):
@@ -203,239 +402,220 @@ def to_excel_bytes(sheets):
     return output.getvalue()
 
 
-st.title("📦 식혜명가 고객 재구매 CRM")
-st.caption("쿠팡/네이버 엑셀 여러 개를 한 번에 올려 신규·재구매·VIP·이탈위험 고객을 분석합니다.")
+# =========================
+# 앱 시작
+# =========================
+st.title("📦 식혜명가 저장형 고객 CRM")
+st.caption("엑셀을 올리면 DB에 누적 저장되고, 다음 접속 때도 고객 데이터가 유지됩니다.")
+
+if sb is None:
+    st.markdown("""
+<div class="warn">
+<b>Supabase 연결이 아직 안 됐습니다.</b><br>
+Streamlit Secrets에 SUPABASE_URL, SUPABASE_KEY를 넣어야 저장형 CRM으로 작동합니다.<br>
+설정 전에는 앱 화면만 확인할 수 있습니다.
+</div>
+""", unsafe_allow_html=True)
+    st.stop()
 
 with st.expander("사용법"):
     st.write("""
-- 쿠팡: `DeliveryList...xlsx`
-- 네이버: `스마트스토어_선택주문발주발송관리...xlsx`
-- 네이버 비밀번호는 자동으로 `1111` 사용
-- 여러 달/여러 해 엑셀을 한 번에 올릴수록 재구매 분석 정확도가 올라갑니다.
-- 네이버는 주문번호 기준, 쿠팡은 묶음배송번호 기준으로 실제 주문 1건을 계산합니다.
+1. 쿠팡/네이버 엑셀을 업로드합니다.
+2. `DB에 저장하기`를 누르면 기존 DB에 누적됩니다.
+3. 중복 주문번호는 자동 덮어쓰기 처리됩니다.
+4. 블랙리스트 탭에서 고객별 주의/블랙 사유를 저장할 수 있습니다.
     """)
 
-uploaded_files = st.file_uploader(
-    "엑셀 파일 여러 개 업로드",
-    type=["xlsx", "xls", "csv"],
-    accept_multiple_files=True,
-)
-
-if not uploaded_files:
-    st.info("쿠팡/네이버 주문 엑셀을 업로드하세요.")
-    st.stop()
-
-frames, errors = [], []
-
-for f in uploaded_files:
-    try:
-        raw = pd.read_csv(f) if f.name.lower().endswith(".csv") else read_excel_file(f)
-        market = detect_market(f.name, raw)
-        std = standardize(raw, market, f.name)
-        frames.append(std)
-        st.success(f"{f.name} 읽기 성공: {market} / 원본 {len(raw):,}행 → 정리 {len(std):,}행")
-    except Exception as e:
-        errors.append((f.name, str(e)))
-
-for name, msg in errors:
-    st.error(f"{name}: {msg}")
-
-if not frames:
-    st.stop()
-
-raw_orders = pd.concat(frames, ignore_index=True)
-raw_orders = raw_orders.dropna(subset=["주문일"]).sort_values("주문일")
-
-if raw_orders.empty:
-    st.error("주문일을 찾지 못했습니다.")
-    st.stop()
-
-use_phone = st.toggle(
-    "전화번호까지 포함해서 더 엄격하게 고객 구분",
-    value=False,
-    help="기본은 이름+주소 기준입니다. 쿠팡 050 안심번호 때문에 재구매가 분리되는 것을 막기 위함입니다.",
-)
-
-customer_key_col = "전화포함고객키" if use_phone else "고객키"
-
-group_cols = [
-    "판매채널", "주문단위번호", "주문단위키",
-    customer_key_col, "수취인", "수취인전화", "구매자", "구매자전화", "주소"
-]
-
-order_level = (
-    raw_orders.groupby(group_cols, dropna=False)
-    .agg(
-        주문일=("주문일", "min"),
-        상품주문번호목록=("상품주문번호", join_unique),
-        상품명=("상품명", join_unique),
-        총수량=("수량", "sum"),
-        결제금액=("결제금액", "sum"),
-        원본행수=("상품주문번호", "count"),
-    )
-    .reset_index()
-    .rename(columns={customer_key_col: "분석고객키"})
-)
-
-customer = (
-    order_level.groupby("분석고객키", dropna=False)
-    .agg(
-        고객명=("수취인", "first"),
-        전화번호=("수취인전화", "first"),
-        주소=("주소", "first"),
-        총주문횟수=("주문단위키", pd.Series.nunique),
-        첫구매일=("주문일", "min"),
-        최근구매일=("주문일", "max"),
-        누적구매금액=("결제금액", "sum"),
-        누적수량=("총수량", "sum"),
-        이용채널=("판매채널", join_unique),
-        구매상품=("상품명", join_unique),
-    )
-    .reset_index(drop=True)
-)
-
-customer["고객구분"] = customer["총주문횟수"].apply(lambda x: "재구매" if x >= 2 else "신규")
-customer["고객등급"] = customer["총주문횟수"].apply(customer_grade)
-customer["첫구매일"] = pd.to_datetime(customer["첫구매일"])
-customer["최근구매일"] = pd.to_datetime(customer["최근구매일"])
-customer["구매기간일"] = (customer["최근구매일"] - customer["첫구매일"]).dt.days
-
-today = pd.Timestamp.today().normalize()
-customer["최근구매후경과일"] = (today - customer["최근구매일"].dt.normalize()).dt.days
-
-def churn_status(days):
-    if days >= 180:
-        return "장기이탈"
-    if days >= 90:
-        return "이탈위험"
-    if days >= 60:
-        return "관심필요"
-    return "정상"
-
-customer["이탈상태"] = customer["최근구매후경과일"].apply(churn_status)
-customer["평균주문금액"] = (customer["누적구매금액"] / customer["총주문횟수"]).round(0).astype(int)
-
-# 주문 간격 계산
-order_gap = order_level.sort_values(["분석고객키", "주문일"]).copy()
-order_gap["이전주문일"] = order_gap.groupby("분석고객키")["주문일"].shift(1)
-order_gap["주문간격일"] = (order_gap["주문일"] - order_gap["이전주문일"]).dt.days
-avg_gap = order_gap.groupby("분석고객키")["주문간격일"].mean().reset_index(name="평균재구매간격일")
-customer = customer.merge(avg_gap, left_on="고객명", right_on="분석고객키", how="left").drop(columns=["분석고객키"], errors="ignore")
-customer["평균재구매간격일"] = customer["평균재구매간격일"].round(1)
-
-# 세그먼트
-vip = customer[customer["총주문횟수"] >= 5].copy()
-repeat = customer[customer["총주문횟수"] >= 2].copy()
-churn_risk = customer[customer["최근구매후경과일"] >= 90].copy()
-sms_target = customer[(customer["총주문횟수"] >= 2) & (customer["최근구매후경과일"] >= 60)].copy()
-
-total_raw_rows = len(raw_orders)
-total_orders = len(order_level)
-total_customers = len(customer)
-repeat_customers = int((customer["총주문횟수"] >= 2).sum())
-new_customers = total_customers - repeat_customers
-repeat_rate = repeat_customers / total_customers * 100 if total_customers else 0
-vip_count = len(vip)
-
-cols = st.columns(7)
-kpis = [
-    ("원본 상품행", f"{total_raw_rows:,}행"),
-    ("실제 주문", f"{total_orders:,}건"),
-    ("전체 고객", f"{total_customers:,}명"),
-    ("신규", f"{new_customers:,}명"),
-    ("재구매", f"{repeat_customers:,}명"),
-    ("재구매율", f"{repeat_rate:.1f}%"),
-    ("VIP", f"{vip_count:,}명"),
-]
-for col, (title, val) in zip(cols, kpis):
-    with col:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title">{title}</div><div class="kpi-value">{val}</div></div>', unsafe_allow_html=True)
-
-st.write("")
-st.markdown('<div class="note">재구매는 고객별 실제 주문번호가 2개 이상일 때만 잡습니다. 여러 해 파일을 누적해서 올리면 CRM처럼 쓸 수 있습니다.</div>', unsafe_allow_html=True)
-st.write("")
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📊 대시보드", "👤 고객별 CRM", "💎 VIP/재구매", "⚠️ 이탈위험", "📦 주문단위", "🧾 원본행", "⬇️ 다운로드"
+tab_upload, tab_dashboard, tab_customers, tab_black, tab_orders, tab_download = st.tabs([
+    "⬆️ 엑셀 업로드", "📊 대시보드", "👤 고객 CRM", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
 ])
 
-with tab1:
+with tab_upload:
+    uploaded_files = st.file_uploader(
+        "쿠팡/네이버 엑셀 여러 개 업로드",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded_files:
+        frames, errors = [], []
+
+        for f in uploaded_files:
+            try:
+                raw = pd.read_csv(f) if f.name.lower().endswith(".csv") else read_excel_file(f)
+                market = detect_market(f.name, raw)
+                std = standardize(raw, market, f.name)
+                frames.append(std)
+                st.success(f"{f.name} 읽기 성공: {market} / 원본 {len(raw):,}행 → 정리 {len(std):,}행")
+            except Exception as e:
+                errors.append((f.name, str(e)))
+
+        for name, msg in errors:
+            st.error(f"{name}: {msg}")
+
+        if frames:
+            raw_orders = pd.concat(frames, ignore_index=True)
+            order_preview = make_order_level(raw_orders, use_strict=False)
+
+            st.subheader("저장 전 미리보기")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("원본 상품행", f"{len(raw_orders):,}행")
+            c2.metric("실제 주문", f"{len(order_preview):,}건")
+            c3.metric("예상 고객", f"{order_preview['analysis_customer_key'].nunique():,}명")
+
+            st.dataframe(order_preview.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
+
+            if st.button("DB에 저장하기", type="primary"):
+                saved = upsert_orders(order_preview)
+                st.success(f"{saved:,}건 저장 완료. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
+
+# DB 데이터 로드
+orders_db = fetch_orders_as_order_level()
+black_df = fetch_blacklist()
+
+if orders_db.empty:
+    with tab_dashboard:
+        st.info("아직 저장된 주문 DB가 없습니다. 먼저 엑셀을 업로드하고 DB에 저장하세요.")
+    st.stop()
+
+customer_df = make_customer_df(orders_db)
+
+if not black_df.empty:
+    customer_df = customer_df.merge(
+        black_df[["customer_key", "status", "reason", "memo", "incident_date", "result"]],
+        left_on="analysis_customer_key",
+        right_on="customer_key",
+        how="left"
+    )
+else:
+    customer_df["status"] = ""
+    customer_df["reason"] = ""
+    customer_df["memo"] = ""
+    customer_df["incident_date"] = ""
+    customer_df["result"] = ""
+
+customer_df["black_status"] = customer_df["status"].fillna("정상").replace("", "정상")
+
+with tab_dashboard:
+    total_orders = len(orders_db)
+    total_customers = len(customer_df)
+    repeat_customers = int((customer_df["order_count"] >= 2).sum())
+    repeat_rate = repeat_customers / total_customers * 100 if total_customers else 0
+    vip_count = int((customer_df["order_count"] >= 5).sum())
+    black_count = int((customer_df["black_status"].isin(["주의", "블랙"])).sum())
+
+    cols = st.columns(6)
+    for col, (title, val) in zip(cols, [
+        ("누적 주문", f"{total_orders:,}건"),
+        ("누적 고객", f"{total_customers:,}명"),
+        ("재구매 고객", f"{repeat_customers:,}명"),
+        ("재구매율", f"{repeat_rate:.1f}%"),
+        ("VIP", f"{vip_count:,}명"),
+        ("주의/블랙", f"{black_count:,}명"),
+    ]):
+        with col:
+            st.markdown(f'<div class="kpi-card"><div class="kpi-title">{title}</div><div class="kpi-value">{val}</div></div>', unsafe_allow_html=True)
+
+    st.write("")
     left, right = st.columns(2)
 
     with left:
-        st.subheader("월별 실제 주문")
-        monthly = order_level.copy()
-        monthly["월"] = pd.to_datetime(monthly["주문일"]).dt.to_period("M").astype(str)
+        st.subheader("월별 누적 주문")
+        monthly = orders_db.copy()
+        monthly["월"] = pd.to_datetime(monthly["order_date"]).dt.to_period("M").astype(str)
         st.bar_chart(monthly.groupby("월").size())
 
     with right:
-        st.subheader("구매횟수별 고객 수")
-        repeat_bucket = customer["총주문횟수"].apply(lambda x: "1회" if x == 1 else "2회" if x == 2 else "3회" if x == 3 else "4회 이상")
-        st.bar_chart(repeat_bucket.value_counts().reindex(["1회", "2회", "3회", "4회 이상"]).fillna(0))
+        st.subheader("구매횟수별 고객")
+        bucket = customer_df["order_count"].apply(lambda x: "1회" if x == 1 else "2회" if x == 2 else "3회" if x == 3 else "4회 이상")
+        st.bar_chart(bucket.value_counts().reindex(["1회", "2회", "3회", "4회 이상"]).fillna(0))
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("채널별 실제 주문")
-        st.dataframe(order_level.groupby("판매채널").size().reset_index(name="실제주문수"), use_container_width=True, hide_index=True)
-    with c2:
-        st.subheader("이탈상태")
-        st.dataframe(customer["이탈상태"].value_counts().rename_axis("상태").reset_index(name="고객수"), use_container_width=True, hide_index=True)
+with tab_customers:
+    st.subheader("고객 CRM")
+    grades = st.multiselect("고객등급", sorted(customer_df["grade"].unique()), default=sorted(customer_df["grade"].unique()))
+    black_statuses = st.multiselect("블랙상태", sorted(customer_df["black_status"].unique()), default=sorted(customer_df["black_status"].unique()))
 
-with tab2:
-    st.subheader("고객별 CRM")
-    grades = st.multiselect("고객등급 필터", sorted(customer["고객등급"].unique()), default=sorted(customer["고객등급"].unique()))
-    statuses = st.multiselect("이탈상태 필터", sorted(customer["이탈상태"].unique()), default=sorted(customer["이탈상태"].unique()))
-    view = customer[(customer["고객등급"].isin(grades)) & (customer["이탈상태"].isin(statuses))]
-    view = view.sort_values(["총주문횟수", "최근구매일"], ascending=[False, False])
+    view = customer_df[(customer_df["grade"].isin(grades)) & (customer_df["black_status"].isin(black_statuses))]
+    view = view.sort_values(["order_count", "last_order_date"], ascending=[False, False])
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-with tab3:
-    st.subheader("VIP / 재구매 고객")
-    st.caption("VIP는 5회 이상, 우수고객은 3~4회, 재구매는 2회 기준입니다.")
-    st.dataframe(repeat.sort_values(["총주문횟수", "누적구매금액"], ascending=[False, False]), use_container_width=True, hide_index=True)
+with tab_black:
+    st.subheader("블랙리스트 / 주의고객 관리")
 
-with tab4:
-    st.subheader("이탈위험 고객")
-    st.caption("90일 이상 미구매는 이탈위험, 180일 이상은 장기이탈로 분류합니다.")
-    st.dataframe(churn_risk.sort_values(["최근구매후경과일", "총주문횟수"], ascending=[False, False]), use_container_width=True, hide_index=True)
+    customer_options = customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]).copy()
+    customer_options["label"] = (
+        customer_options["customer_name"].astype(str)
+        + " | "
+        + customer_options["phone"].astype(str)
+        + " | "
+        + customer_options["address"].astype(str).str[:40]
+    )
 
-    st.subheader("문자/쿠폰 발송 후보")
-    st.caption("2회 이상 구매했고 60일 이상 미구매한 고객입니다.")
-    st.dataframe(sms_target.sort_values(["최근구매후경과일", "총주문횟수"], ascending=[False, False]), use_container_width=True, hide_index=True)
+    selected_label = st.selectbox("고객 선택", customer_options["label"].tolist())
+    selected = customer_options[customer_options["label"] == selected_label].iloc[0]
 
-with tab5:
-    st.subheader("주문 단위 정리")
-    st.dataframe(order_level.sort_values("주문일", ascending=False), use_container_width=True, hide_index=True)
+    with st.form("black_form"):
+        status = st.selectbox("상태", ["정상", "주의", "블랙"], index=0)
+        reason = st.selectbox("사유", ["", "반복 환불 요구", "허위 클레임", "배송 트집", "폭언/욕설", "고의 반품", "기타"])
+        incident_date = st.date_input("발생일", value=date.today())
+        result = st.text_input("처리 결과", placeholder="예: 재배송함 / 환불함 / 다음 주문 시 확인")
+        memo = st.text_area("상세 기록", placeholder="어떤 문제가 있었는지 기록")
+        submitted = st.form_submit_button("저장")
 
-with tab6:
-    st.subheader("원본행 정리")
-    st.dataframe(raw_orders.sort_values("주문일", ascending=False), use_container_width=True, hide_index=True)
+    if submitted:
+        row = {
+            "customer_key": str(selected["analysis_customer_key"]),
+            "customer_name": str(selected["customer_name"]),
+            "phone": str(selected["phone"]),
+            "address": str(selected["address"]),
+            "status": status,
+            "reason": reason,
+            "memo": memo,
+            "incident_date": str(incident_date),
+            "result": result,
+        }
+        save_blacklist(row)
+        st.success("블랙리스트 기록 저장 완료. 새로고침하면 반영됩니다.")
 
-with tab7:
+    st.subheader("현재 블랙리스트")
+    st.dataframe(black_df.sort_values("updated_at", ascending=False) if "updated_at" in black_df.columns else black_df, use_container_width=True, hide_index=True)
+
+    if not black_df.empty:
+        delete_key = st.selectbox("삭제할 기록 선택", black_df["customer_key"].tolist())
+        if st.button("선택 기록 삭제"):
+            delete_blacklist(delete_key)
+            st.success("삭제 완료. 새로고침하면 반영됩니다.")
+
+with tab_orders:
+    st.subheader("저장된 주문 DB")
+    st.dataframe(orders_db.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
+
+with tab_download:
+    st.subheader("엑셀 다운로드")
+
+    vip = customer_df[customer_df["order_count"] >= 5].copy()
+    repeat = customer_df[customer_df["order_count"] >= 2].copy()
+    churn_risk = customer_df[customer_df["days_since_last_order"] >= 90].copy()
+    black_customers = customer_df[customer_df["black_status"].isin(["주의", "블랙"])].copy()
+
     summary = pd.DataFrame({
-        "항목": ["원본 상품행", "실제 주문", "전체 고객", "신규 고객", "재구매 고객", "재구매율", "VIP", "이탈위험", "장기이탈"],
-        "값": [
-            total_raw_rows, total_orders, total_customers, new_customers,
-            repeat_customers, f"{repeat_rate:.1f}%", vip_count,
-            int((customer["이탈상태"] == "이탈위험").sum()),
-            int((customer["이탈상태"] == "장기이탈").sum()),
-        ]
+        "항목": ["누적 주문", "누적 고객", "재구매 고객", "재구매율", "VIP", "주의/블랙"],
+        "값": [len(orders_db), len(customer_df), len(repeat), f"{repeat_rate:.1f}%", len(vip), len(black_customers)]
     })
 
     excel_bytes = to_excel_bytes({
         "요약": summary,
-        "고객별CRM": customer.sort_values(["총주문횟수", "최근구매일"], ascending=[False, False]),
-        "VIP재구매": repeat.sort_values(["총주문횟수", "누적구매금액"], ascending=[False, False]),
-        "이탈위험": churn_risk.sort_values(["최근구매후경과일", "총주문횟수"], ascending=[False, False]),
-        "문자발송후보": sms_target.sort_values(["최근구매후경과일", "총주문횟수"], ascending=[False, False]),
-        "주문단위정리": order_level.sort_values("주문일", ascending=False),
-        "원본행정리": raw_orders.sort_values("주문일", ascending=False),
+        "고객CRM": customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]),
+        "VIP": vip,
+        "재구매": repeat,
+        "이탈위험": churn_risk,
+        "블랙리스트": black_customers,
+        "주문DB": orders_db.sort_values("order_date", ascending=False),
     })
 
     st.download_button(
-        "CRM 분석 결과 엑셀 다운로드",
+        "저장형 CRM 엑셀 다운로드",
         data=excel_bytes,
-        file_name=f"sikhye_customer_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        file_name=f"sikhye_saved_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    st.caption("앱은 업로드 파일을 따로 저장하지 않습니다.")
