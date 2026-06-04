@@ -47,6 +47,32 @@ st.markdown("""
     padding:14px 16px;
     border-radius:12px;
 }
+
+.upload-guide {
+    border: 2px dashed #cbd5e1;
+    background: #f8fafc;
+    border-radius: 18px;
+    padding: 22px;
+    text-align: center;
+    margin-bottom: 14px;
+}
+.upload-title {
+    font-size: 22px;
+    font-weight: 800;
+    margin-bottom: 6px;
+}
+.upload-sub {
+    color: #64748b;
+    font-size: 14px;
+}
+.summary-box {
+    background: #ecfdf5;
+    border: 1px solid #bbf7d0;
+    border-radius: 16px;
+    padding: 16px 18px;
+    margin: 12px 0;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -419,7 +445,7 @@ def to_excel_bytes(sheets):
 # 앱 시작
 # =========================
 st.title("📦 식혜명가 저장형 고객 CRM")
-st.caption("엑셀을 올리면 DB에 누적 저장되고, 다음 접속 때도 고객 데이터가 유지됩니다.")
+st.caption("엑셀 업로드 → 오늘 재구매/VIP/블랙 즉시 확인 → DB 누적 저장까지 한 번에 처리합니다.")
 
 if sb is None:
     st.markdown("""
@@ -439,29 +465,75 @@ with st.expander("사용법"):
 4. 블랙리스트 탭에서 고객별 주의/블랙 사유를 저장할 수 있습니다.
     """)
 
-tab_upload, tab_dashboard, tab_customers, tab_black, tab_orders, tab_download = st.tabs([
-    "⬆️ 엑셀 업로드", "📊 대시보드", "👤 고객 CRM", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
+tab_upload, tab_today, tab_dashboard, tab_customers, tab_black, tab_orders, tab_download = st.tabs([
+    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📊 대시보드", "👤 고객 CRM", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
 ])
 
+if "today_order_preview" not in st.session_state:
+    st.session_state["today_order_preview"] = pd.DataFrame()
+if "today_customer_analysis" not in st.session_state:
+    st.session_state["today_customer_analysis"] = pd.DataFrame()
+if "today_detail_analysis" not in st.session_state:
+    st.session_state["today_detail_analysis"] = pd.DataFrame()
+
 with tab_upload:
+    st.markdown("""
+    <div class="upload-guide">
+        <div class="upload-title">📂 쿠팡/네이버 엑셀을 여기에 끌어다 놓기</div>
+        <div class="upload-sub">파일 여러 개를 한 번에 드래그하거나, 아래 큰 버튼을 눌러 추가 업로드하세요.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
     uploaded_files = st.file_uploader(
-        "쿠팡/네이버 엑셀 여러 개 업로드",
+        "➕ 엑셀 파일 추가 업로드",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
+        help="쿠팡 DeliveryList, 네이버 스마트스토어 엑셀을 여러 개 동시에 올릴 수 있습니다.",
     )
 
     if uploaded_files:
         frames, errors = [], []
 
-        for f in uploaded_files:
+        read_logs = []
+
+        progress = st.progress(0, text="엑셀 읽는 중...")
+        for idx, f in enumerate(uploaded_files, start=1):
             try:
                 raw = pd.read_csv(f) if f.name.lower().endswith(".csv") else read_excel_file(f)
                 market = detect_market(f.name, raw)
                 std = standardize(raw, market, f.name)
                 frames.append(std)
-                st.success(f"{f.name} 읽기 성공: {market} / 원본 {len(raw):,}행 → 정리 {len(std):,}행")
+                read_logs.append({
+                    "파일명": f.name,
+                    "채널": market,
+                    "원본행": len(raw),
+                    "정리행": len(std),
+                    "상태": "성공",
+                })
             except Exception as e:
                 errors.append((f.name, str(e)))
+                read_logs.append({
+                    "파일명": f.name,
+                    "채널": "",
+                    "원본행": 0,
+                    "정리행": 0,
+                    "상태": "실패",
+                })
+            progress.progress(idx / len(uploaded_files), text=f"{idx}/{len(uploaded_files)}개 처리 중")
+
+        progress.empty()
+
+        log_df = pd.DataFrame(read_logs)
+        success_count = int((log_df["상태"] == "성공").sum()) if not log_df.empty else 0
+        fail_count = int((log_df["상태"] == "실패").sum()) if not log_df.empty else 0
+        st.markdown(
+            f'<div class="summary-box">✅ 업로드 처리 완료: 성공 <b>{success_count:,}</b>개 / 실패 <b>{fail_count:,}</b>개</div>',
+            unsafe_allow_html=True
+        )
+
+        with st.expander("파일별 처리 상세 보기", expanded=False):
+            if not log_df.empty:
+                st.dataframe(log_df, use_container_width=True, hide_index=True)
 
         for name, msg in errors:
             st.error(f"{name}: {msg}")
@@ -470,17 +542,48 @@ with tab_upload:
             raw_orders = pd.concat(frames, ignore_index=True)
             order_preview = make_order_level(raw_orders, use_strict=False)
 
-            st.subheader("저장 전 미리보기")
-            c1, c2, c3 = st.columns(3)
+            # 기존 DB와 비교한 오늘 주문 분석을 세션에 저장
+            orders_db_current = fetch_orders_as_order_level()
+            customer_df_current = make_customer_df(orders_db_current) if not orders_db_current.empty else pd.DataFrame()
+            black_df_current = fetch_blacklist()
+            today_customer_analysis, today_detail_analysis = analyze_today_orders(
+                order_preview, orders_db_current, customer_df_current, black_df_current
+            )
+            st.session_state["today_order_preview"] = order_preview
+            st.session_state["today_customer_analysis"] = today_customer_analysis
+            st.session_state["today_detail_analysis"] = today_detail_analysis
+
+            st.subheader("오늘 업로드 요약")
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("원본 상품행", f"{len(raw_orders):,}행")
             c2.metric("실제 주문", f"{len(order_preview):,}건")
             c3.metric("예상 고객", f"{order_preview['analysis_customer_key'].nunique():,}명")
+            c4.metric("오늘 재구매", f"{int((today_customer_analysis['기존주문횟수'] >= 1).sum()) if not today_customer_analysis.empty else 0:,}명")
+            c5.metric("주의/블랙", f"{int((today_customer_analysis['블랙상태'].isin(['주의','블랙'])).sum()) if not today_customer_analysis.empty else 0:,}명")
 
-            st.dataframe(order_preview.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
+            st.success("분석 완료. 위쪽의 `🔥 오늘 주문 분석` 탭에서 재구매/VIP/블랙 고객을 색상으로 확인하세요.")
 
-            if st.button("DB에 저장하기", type="primary"):
-                saved = upsert_orders(order_preview)
-                st.success(f"{saved:,}건 저장 완료. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
+            with st.expander("오늘 주문 고객 요약 바로 보기", expanded=True):
+                if not today_customer_analysis.empty:
+                    st.dataframe(style_today_customer_table(today_customer_analysis), use_container_width=True, hide_index=True)
+                else:
+                    st.info("오늘 주문 분석 데이터가 없습니다.")
+
+            with st.expander("저장 전 주문 단위 상세 보기", expanded=False):
+                st.dataframe(order_preview.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
+
+            col_save, col_clear = st.columns([1, 1])
+            with col_save:
+                if st.button("DB에 저장하기", type="primary", use_container_width=True):
+                    saved = upsert_orders(order_preview)
+                    st.success(f"{saved:,}건 저장 완료. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
+                    st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
+            with col_clear:
+                if st.button("화면 분석 결과 초기화", use_container_width=True):
+                    st.session_state["today_order_preview"] = pd.DataFrame()
+                    st.session_state["today_customer_analysis"] = pd.DataFrame()
+                    st.session_state["today_detail_analysis"] = pd.DataFrame()
+                    st.rerun()
 
 # DB 데이터 로드
 orders_db = fetch_orders_as_order_level()
@@ -508,6 +611,67 @@ else:
     customer_df["result"] = ""
 
 customer_df["black_status"] = customer_df["status"].fillna("정상").replace("", "정상")
+
+with tab_today:
+    st.subheader("🔥 오늘 주문 분석")
+    st.caption("엑셀 업로드 후 DB 저장 전에도 기존 DB와 비교해서 오늘 주문 고객이 신규인지 재구매인지 바로 확인합니다.")
+
+    today_customer_analysis = st.session_state.get("today_customer_analysis", pd.DataFrame())
+    today_detail_analysis = st.session_state.get("today_detail_analysis", pd.DataFrame())
+
+    if today_customer_analysis is None or today_customer_analysis.empty:
+        st.info("먼저 `엑셀 업로드` 탭에서 오늘 쿠팡/네이버 엑셀을 업로드하세요.")
+    else:
+        total_today_customers = len(today_customer_analysis)
+        reorder_count = int((today_customer_analysis["기존주문횟수"] >= 1).sum())
+        new_count = int((today_customer_analysis["기존주문횟수"] == 0).sum())
+        vip_reorder_count = int(today_customer_analysis["오늘고객상태"].astype(str).str.contains("VIP").sum())
+        black_today_count = int(today_customer_analysis["블랙상태"].isin(["주의", "블랙"]).sum())
+
+        a, b, c, d, e = st.columns(5)
+        a.metric("오늘 고객", f"{total_today_customers:,}명")
+        b.metric("오늘 신규", f"{new_count:,}명")
+        c.metric("오늘 재구매", f"{reorder_count:,}명")
+        d.metric("VIP 재주문", f"{vip_reorder_count:,}명")
+        e.metric("주의/블랙", f"{black_today_count:,}명")
+
+        st.markdown("""
+        - ⚪ 신규: 기존 DB에 없던 고객
+        - 🟢 재주문: 기존 주문 이력이 있는 고객
+        - 🟡 VIP 재주문: 기존 5회 이상 구매 고객
+        - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
+        - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
+        """)
+
+        filter_status = st.multiselect(
+            "상태 필터",
+            options=sorted(today_customer_analysis["오늘고객상태"].unique()),
+            default=sorted(today_customer_analysis["오늘고객상태"].unique()),
+        )
+
+        view_today = today_customer_analysis[today_customer_analysis["오늘고객상태"].isin(filter_status)]
+        st.dataframe(style_today_customer_table(view_today), use_container_width=True, hide_index=True, height=420)
+
+        st.subheader("고객별 역대 주문내역 보기")
+        selected_customer = st.selectbox(
+            "고객 선택",
+            options=view_today["고객키"].tolist(),
+            format_func=lambda k: view_today.loc[view_today["고객키"] == k, "오늘고객명"].iloc[0] + " | " + str(view_today.loc[view_today["고객키"] == k, "오늘고객상태"].iloc[0])
+        )
+
+        history = orders_db[orders_db["analysis_customer_key"] == selected_customer].sort_values("order_date", ascending=False)
+        st.write("기존 DB 저장 주문내역")
+        if history.empty:
+            st.info("기존 주문내역 없음. 이번 주문이 첫 주문입니다.")
+        else:
+            st.dataframe(history, use_container_width=True, hide_index=True)
+
+        if today_detail_analysis is not None and not today_detail_analysis.empty:
+            st.write("이번 업로드 주문 상세")
+            today_detail_customer = today_detail_analysis[today_detail_analysis["analysis_customer_key"] == selected_customer]
+            st.dataframe(today_detail_customer, use_container_width=True, hide_index=True)
+
+
 
 with tab_dashboard:
     total_orders = len(orders_db)
@@ -616,7 +780,7 @@ with tab_download:
         "값": [len(orders_db), len(customer_df), len(repeat), f"{repeat_rate:.1f}%", len(vip), len(black_customers)]
     })
 
-    excel_bytes = to_excel_bytes({
+    download_sheets = {
         "요약": summary,
         "고객CRM": customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]),
         "VIP": vip,
@@ -624,7 +788,16 @@ with tab_download:
         "이탈위험": churn_risk,
         "블랙리스트": black_customers,
         "주문DB": orders_db.sort_values("order_date", ascending=False),
-    })
+    }
+
+    today_customer_analysis = st.session_state.get("today_customer_analysis", pd.DataFrame())
+    today_detail_analysis = st.session_state.get("today_detail_analysis", pd.DataFrame())
+    if today_customer_analysis is not None and not today_customer_analysis.empty:
+        download_sheets["오늘주문분석"] = today_customer_analysis
+    if today_detail_analysis is not None and not today_detail_analysis.empty:
+        download_sheets["오늘주문상세"] = today_detail_analysis
+
+    excel_bytes = to_excel_bytes(download_sheets)
 
     st.download_button(
         "저장형 CRM 엑셀 다운로드",
