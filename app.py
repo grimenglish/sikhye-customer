@@ -732,16 +732,13 @@ def make_ai_context(customer_df, orders_db):
     product_text = ""
     if orders_db is not None and not orders_db.empty and "product_names" in orders_db.columns:
         product_counts = orders_db["product_names"].astype(str).value_counts().head(10)
-        product_text = "
-".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
-
+       product_text = "\n".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
     monthly_text = ""
     if orders_db is not None and not orders_db.empty and "order_date" in orders_db.columns:
         temp = orders_db.copy()
         temp["월"] = pd.to_datetime(temp["order_date"], errors="coerce", utc=True).dt.to_period("M").astype(str)
         monthly = temp.groupby("월").size().tail(12)
-        monthly_text = "
-".join([f"- {idx}: {val}건" for idx, val in monthly.items()])
+monthly_text = "\n".join([f"- {idx}: {val}건" for idx, val in monthly.items()])
 
     return f"""
 식혜명가 CRM 집계 요약:
