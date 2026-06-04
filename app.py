@@ -450,6 +450,36 @@ def delete_blacklist(customer_key):
     sb.table("blacklist").delete().eq("customer_key", customer_key).execute()
 
 
+
+
+def fetch_customer_notes():
+    df = fetch_blacklist()
+    if df.empty:
+        return pd.DataFrame(columns=["customer_key", "memo", "updated_at"])
+    notes = df[df.get("reason", "") == "고객메모"].copy() if "reason" in df.columns else pd.DataFrame()
+    if notes.empty:
+        return pd.DataFrame(columns=["customer_key", "memo", "updated_at"])
+    return notes[["customer_key", "memo", "updated_at"]].copy()
+
+
+def save_customer_note(customer_key, customer_name, phone, address, memo):
+    if sb is None:
+        return
+    row = {
+        "customer_key": str(customer_key),
+        "customer_name": str(customer_name),
+        "phone": str(phone),
+        "address": str(address),
+        "status": "메모",
+        "reason": "고객메모",
+        "memo": str(memo),
+        "incident_date": str(date.today()),
+        "result": "",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    sb.table("blacklist").upsert([row], on_conflict="customer_key").execute()
+
+
 def to_excel_bytes(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -634,8 +664,8 @@ with st.expander("사용법"):
 4. 블랙리스트 탭에서 고객별 주의/블랙 사유를 저장할 수 있습니다.
     """)
 
-tab_upload, tab_today, tab_dashboard, tab_customers, tab_black, tab_orders, tab_download = st.tabs([
-    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📊 대시보드", "👤 고객 CRM", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
+tab_upload, tab_today, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_black, tab_orders, tab_download = st.tabs([
+    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
 ])
 
 if "today_order_preview" not in st.session_state:
@@ -884,6 +914,82 @@ with tab_customers:
     view = customer_df[(customer_df["grade"].isin(grades)) & (customer_df["black_status"].isin(black_statuses))]
     view = view.sort_values(["order_count", "last_order_date"], ascending=[False, False])
     st.dataframe(view, use_container_width=True, hide_index=True)
+
+
+with tab_detail:
+    st.subheader("🔎 고객 상세")
+    st.caption("고객을 선택하면 주문횟수, 첫/최근 주문일, 전체 주문내역, 고객 메모를 볼 수 있습니다.")
+
+    customer_view = customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]).copy()
+    customer_view["label"] = (
+        customer_view["customer_name"].astype(str)
+        + " | "
+        + customer_view["phone"].astype(str)
+        + " | "
+        + customer_view["order_count"].astype(str)
+        + "회"
+    )
+
+    keyword = st.text_input("이름/전화번호/주소 검색")
+    if keyword:
+        mask = (
+            customer_view["customer_name"].astype(str).str.contains(keyword, case=False, na=False)
+            | customer_view["phone"].astype(str).str.contains(keyword, case=False, na=False)
+            | customer_view["address"].astype(str).str.contains(keyword, case=False, na=False)
+        )
+        customer_view = customer_view[mask]
+
+    if customer_view.empty:
+        st.info("검색 결과가 없습니다.")
+    else:
+        selected_label = st.selectbox("고객 선택", customer_view["label"].tolist())
+        selected = customer_view[customer_view["label"] == selected_label].iloc[0]
+        key = selected["analysis_customer_key"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("주문횟수", f"{int(selected['order_count']):,}회")
+        c2.metric("등급", str(selected["grade"]))
+        c3.metric("첫 주문일", str(pd.to_datetime(selected["first_order_date"]).date()))
+        c4.metric("최근 주문일", str(pd.to_datetime(selected["last_order_date"]).date()))
+
+        st.write("고객정보")
+        info_df = pd.DataFrame([{
+            "고객명": selected["customer_name"],
+            "전화번호": selected["phone"],
+            "주소": selected["address"],
+            "이용채널": selected["channels"],
+            "구매상품": selected["products"],
+        }])
+        st.dataframe(info_df, use_container_width=True, hide_index=True)
+
+        st.write("고객 메모")
+        notes_df = fetch_customer_notes()
+        old_memo = ""
+        if not notes_df.empty and key in notes_df["customer_key"].astype(str).values:
+            old_memo = notes_df[notes_df["customer_key"].astype(str) == str(key)]["memo"].iloc[0]
+        memo_input = st.text_area("메모 입력", value=old_memo, placeholder="예: 단호박 선호 / 행사 대량주문 / CS 주의")
+        if st.button("고객 메모 저장", type="primary"):
+            save_customer_note(key, selected["customer_name"], selected["phone"], selected["address"], memo_input)
+            st.success("고객 메모 저장 완료")
+
+        st.write("전체 주문내역")
+        history = orders_db[orders_db["analysis_customer_key"] == key].sort_values("order_date", ascending=False)
+        st.dataframe(history, use_container_width=True, hide_index=True)
+
+
+with tab_vip:
+    st.subheader("⭐ VIP 고객")
+    st.caption("기본 5회 이상, 필요하면 기준을 바꿔 확인할 수 있습니다.")
+
+    vip_min = st.slider("VIP 기준 주문횟수", min_value=2, max_value=20, value=5, step=1)
+    vip_df = customer_df[customer_df["order_count"] >= vip_min].sort_values(["order_count", "last_order_date"], ascending=[False, False])
+
+    a, b = st.columns(2)
+    a.metric("VIP 고객수", f"{len(vip_df):,}명")
+    b.metric("최고 주문횟수", f"{int(vip_df['order_count'].max()) if not vip_df.empty else 0:,}회")
+
+    st.dataframe(vip_df, use_container_width=True, hide_index=True)
+
 
 with tab_black:
     st.subheader("블랙리스트 / 주의고객 관리")
