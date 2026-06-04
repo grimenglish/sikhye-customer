@@ -80,6 +80,45 @@ st.markdown("""
 SMARTSTORE_PASSWORD = "1111"
 
 
+
+# =========================
+# 앱 비밀번호 로그인
+# =========================
+def require_login():
+    app_password = st.secrets.get("APP_PASSWORD", "")
+
+    if not app_password:
+        st.error("APP_PASSWORD가 Streamlit Secrets에 설정되지 않았습니다. 개인정보 보호를 위해 앱을 열 수 없습니다.")
+        st.stop()
+
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if st.session_state["authenticated"]:
+        with st.sidebar:
+            st.success("로그인됨")
+            if st.button("로그아웃"):
+                st.session_state["authenticated"] = False
+                st.rerun()
+        return
+
+    st.title("🔐 식혜명가 CRM 로그인")
+    st.caption("고객 개인정보 보호를 위해 비밀번호가 필요합니다.")
+
+    password = st.text_input("비밀번호", type="password")
+    if st.button("로그인", type="primary"):
+        if password == app_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+
+    st.stop()
+
+
+require_login()
+
+
 # =========================
 # Supabase 연결
 # =========================
@@ -665,7 +704,7 @@ def style_today_customer_table(df):
 
 
 def make_ai_context(customer_df, orders_db):
-    """AI에게 넘길 CRM 요약. 개인정보 과다 노출 방지를 위해 집계 중심."""
+    """AI에게 넘길 CRM 요약. 개인정보 보호를 위해 이름/전화번호/주소는 전송하지 않음."""
     if customer_df is None or customer_df.empty:
         return "저장된 고객 데이터가 없습니다."
 
@@ -675,42 +714,50 @@ def make_ai_context(customer_df, orders_db):
     vip_customers = int((customer_df["order_count"] >= 5).sum()) if "order_count" in customer_df.columns else 0
     repeat_rate = round(repeat_customers / total_customers * 100, 1) if total_customers else 0
 
-    top_customers = customer_df.sort_values("order_count", ascending=False).head(10)
-    top_amount = customer_df.sort_values("total_amount", ascending=False).head(10) if "total_amount" in customer_df.columns else pd.DataFrame()
+    one_time = int((customer_df["order_count"] == 1).sum()) if "order_count" in customer_df.columns else 0
+    two_time = int((customer_df["order_count"] == 2).sum()) if "order_count" in customer_df.columns else 0
+    three_plus = int((customer_df["order_count"] >= 3).sum()) if "order_count" in customer_df.columns else 0
+
+    top_order_counts = customer_df["order_count"].value_counts().sort_index().head(20).to_dict() if "order_count" in customer_df.columns else {}
 
     product_text = ""
     if orders_db is not None and not orders_db.empty and "product_names" in orders_db.columns:
         product_counts = orders_db["product_names"].astype(str).value_counts().head(10)
-        product_text = "\\n".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
+        product_text = "
+".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
 
-    top_customer_text = "\\n".join([
-        f"- {r.get('customer_name','')} / {int(r.get('order_count',0))}회 / {int(r.get('total_amount',0)):,}원"
-        for _, r in top_customers.iterrows()
-    ])
-
-    top_amount_text = "\\n".join([
-        f"- {r.get('customer_name','')} / {int(r.get('total_amount',0)):,}원 / {int(r.get('order_count',0))}회"
-        for _, r in top_amount.iterrows()
-    ]) if not top_amount.empty else ""
+    monthly_text = ""
+    if orders_db is not None and not orders_db.empty and "order_date" in orders_db.columns:
+        temp = orders_db.copy()
+        temp["월"] = pd.to_datetime(temp["order_date"], errors="coerce", utc=True).dt.to_period("M").astype(str)
+        monthly = temp.groupby("월").size().tail(12)
+        monthly_text = "
+".join([f"- {idx}: {val}건" for idx, val in monthly.items()])
 
     return f"""
-식혜명가 CRM 요약:
+식혜명가 CRM 집계 요약:
 - 누적 주문수: {total_orders:,}건
 - 누적 고객수: {total_customers:,}명
+- 1회 구매 고객수: {one_time:,}명
+- 2회 구매 고객수: {two_time:,}명
+- 3회 이상 구매 고객수: {three_plus:,}명
 - 재구매 고객수: {repeat_customers:,}명
 - 재구매율: {repeat_rate}%
 - VIP 고객수(5회 이상): {vip_customers:,}명
 
-주문횟수 상위 고객:
-{top_customer_text}
+구매횟수 분포:
+{top_order_counts}
 
-누적금액 상위 고객:
-{top_amount_text}
+최근 12개월 주문수:
+{monthly_text}
 
 주요 상품 빈도:
 {product_text}
-"""
 
+주의:
+- 이 요약에는 고객명, 전화번호, 주소 등 개인정보를 포함하지 않는다.
+- 답변도 개인정보 없이 집계와 전략 중심으로 한다.
+"""
 
 
 def auto_ai_crm_analysis(customer_df, orders_db):
@@ -738,7 +785,8 @@ def ask_ai_crm(question, customer_df, orders_db):
     system_prompt = """
 너는 식혜 온라인 판매자의 CRM 분석 비서다.
 답변은 한국어로, 짧고 실무적으로 한다.
-고객 개인정보를 불필요하게 길게 노출하지 말고, 마케팅/재구매/고객관리 관점에서 답한다.
+고객명, 전화번호, 주소 등 개인정보를 절대 출력하지 않는다.
+개별 고객 식별이 아니라 집계/전략/마케팅 액션 중심으로 답한다.
 정확한 숫자는 제공된 CRM 요약 안에서만 사용한다.
 """
 
@@ -746,7 +794,7 @@ def ask_ai_crm(question, customer_df, orders_db):
 
     if provider == "gemini":
         api_key = st.secrets.get("GEMINI_API_KEY", "")
-        model = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+        model = st.secrets.get("GEMINI_MODEL", "gemini-2.0-flash")
         if not api_key:
             return "GEMINI_API_KEY가 Secrets에 없습니다."
 
