@@ -363,7 +363,7 @@ def upsert_orders(order_level):
             "buyer_name": str(r["buyer_name"]),
             "buyer_phone": str(r["buyer_phone"]),
             "address": str(r["address"]),
-            "order_date": pd.to_datetime(r["order_date"]).isoformat(),
+            "order_date": pd.to_datetime(r["order_date"], utc=True, errors="coerce").isoformat(),
             "product_order_nos": str(r["product_order_nos"]),
             "product_names": str(r["product_names"]),
             "total_quantity": int(r["total_quantity"]),
@@ -373,8 +373,16 @@ def upsert_orders(order_level):
             "updated_at": now,
         })
 
-    sb.table("orders").upsert(records, on_conflict="order_key").execute()
-    return len(records)
+    # 대량 저장 시 Supabase/PostgREST 요청 크기 제한에 걸리지 않도록 나눠서 저장
+    chunk_size = 700
+    saved_count = 0
+
+    for i in range(0, len(records), chunk_size):
+        chunk = records[i:i + chunk_size]
+        sb.table("orders").upsert(chunk, on_conflict="order_key").execute()
+        saved_count += len(chunk)
+
+    return saved_count
 
 
 def fetch_orders_as_order_level():
@@ -576,7 +584,7 @@ with tab_upload:
             with col_save:
                 if st.button("DB에 저장하기", type="primary", use_container_width=True):
                     saved = upsert_orders(order_preview)
-                    st.success(f"{saved:,}건 저장 완료. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
+                    st.success(f"{saved:,}건 저장 완료. 대량 자료는 700건씩 나눠 안전하게 저장했습니다. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
                     st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
             with col_clear:
                 if st.button("화면 분석 결과 초기화", use_container_width=True):
