@@ -449,6 +449,146 @@ def to_excel_bytes(sheets):
     return output.getvalue()
 
 
+
+
+def analyze_today_orders(order_preview, orders_db, customer_df, black_df):
+    """업로드한 주문을 DB 저장 전 상태에서 기존 DB와 비교"""
+    if order_preview is None or order_preview.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    today_orders = order_preview.copy()
+    today_orders["order_date"] = pd.to_datetime(today_orders["order_date"], utc=True, errors="coerce")
+
+    if customer_df is None or customer_df.empty:
+        existing = pd.DataFrame(columns=[
+            "analysis_customer_key", "order_count", "first_order_date", "last_order_date",
+            "grade", "days_since_last_order", "total_amount", "avg_order_amount"
+        ])
+    else:
+        need_cols = [
+            "analysis_customer_key", "order_count", "first_order_date", "last_order_date",
+            "grade", "days_since_last_order", "total_amount", "avg_order_amount"
+        ]
+        existing = customer_df.copy()
+        for c in need_cols:
+            if c not in existing.columns:
+                existing[c] = None
+        existing = existing[need_cols]
+
+    today_customer = (
+        today_orders.groupby("analysis_customer_key", dropna=False)
+        .agg(
+            오늘고객명=("receiver_name", "first"),
+            오늘전화번호=("receiver_phone", "first"),
+            오늘주소=("address", "first"),
+            오늘주문수=("order_key", pd.Series.nunique),
+            오늘상품=("product_names", join_unique),
+            오늘수량=("total_quantity", "sum"),
+            오늘금액=("total_amount", "sum"),
+            오늘채널=("channel", join_unique),
+            오늘첫주문일=("order_date", "min"),
+            오늘주문번호=("order_no", join_unique),
+        )
+        .reset_index()
+    )
+
+    result = today_customer.merge(existing, on="analysis_customer_key", how="left")
+    result["기존주문횟수"] = result["order_count"].fillna(0).astype(int)
+    result["이번포함총주문"] = result["기존주문횟수"] + result["오늘주문수"].fillna(0).astype(int)
+    result["첫주문일"] = result["first_order_date"]
+    result["최근주문일"] = result["last_order_date"]
+
+    def status_row(r):
+        old_count = int(r["기존주문횟수"])
+        old_grade = str(r.get("grade", ""))
+        days = r.get("days_since_last_order", None)
+
+        if old_count <= 0:
+            return "⚪ 신규"
+        if old_grade == "VIP" or old_count >= 5:
+            return "🟡 VIP 재주문"
+        try:
+            if pd.notna(days) and int(days) >= 90:
+                return "🔵 복귀 재주문"
+        except Exception:
+            pass
+        return "🟢 재주문"
+
+    result["오늘고객상태"] = result.apply(status_row, axis=1)
+
+    if black_df is not None and not black_df.empty:
+        b = black_df.copy()
+        for c in ["customer_key", "status", "reason", "memo", "incident_date", "result"]:
+            if c not in b.columns:
+                b[c] = ""
+        b = b[["customer_key", "status", "reason", "memo", "incident_date", "result"]]
+        result = result.merge(b, left_on="analysis_customer_key", right_on="customer_key", how="left")
+    else:
+        result["status"] = ""
+        result["reason"] = ""
+        result["memo"] = ""
+        result["incident_date"] = ""
+        result["result"] = ""
+
+    result["블랙상태"] = result["status"].fillna("정상").replace("", "정상")
+    result.loc[result["블랙상태"].isin(["주의", "블랙"]), "오늘고객상태"] = "🔴 주의/블랙"
+
+    final_cols = [
+        "오늘고객상태", "오늘고객명", "오늘전화번호", "오늘채널", "오늘상품",
+        "오늘주문수", "기존주문횟수", "이번포함총주문",
+        "첫주문일", "최근주문일", "days_since_last_order",
+        "오늘금액", "오늘수량", "블랙상태", "reason", "memo", "result",
+        "오늘주소", "오늘주문번호", "analysis_customer_key"
+    ]
+
+    for c in final_cols:
+        if c not in result.columns:
+            result[c] = ""
+
+    result = result[final_cols].rename(columns={
+        "days_since_last_order": "최근구매후경과일",
+        "reason": "블랙사유",
+        "memo": "블랙메모",
+        "result": "처리결과",
+        "analysis_customer_key": "고객키",
+    })
+
+    result = result.sort_values(
+        by=["오늘고객상태", "이번포함총주문", "오늘금액"],
+        ascending=[True, False, False]
+    )
+
+    detail = today_orders.merge(
+        result[["고객키", "오늘고객상태", "기존주문횟수", "이번포함총주문", "블랙상태", "블랙사유"]],
+        left_on="analysis_customer_key",
+        right_on="고객키",
+        how="left"
+    )
+
+    return result, detail
+
+
+def style_today_customer_table(df):
+    """오늘 주문 분석 표 색상"""
+    if df is None or df.empty:
+        return df
+
+    def row_style(row):
+        status = str(row.get("오늘고객상태", ""))
+        black = str(row.get("블랙상태", ""))
+
+        if "🔴" in status or black in ["주의", "블랙"]:
+            return ["background-color: #fee2e2"] * len(row)
+        if "🟡" in status:
+            return ["background-color: #fef3c7"] * len(row)
+        if "🔵" in status:
+            return ["background-color: #dbeafe"] * len(row)
+        if "🟢" in status:
+            return ["background-color: #dcfce7"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(row_style, axis=1)
+
 # =========================
 # 앱 시작
 # =========================
