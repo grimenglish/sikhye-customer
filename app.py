@@ -5,6 +5,7 @@ from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
+import requests
 
 try:
     import msoffcrypto
@@ -619,6 +620,28 @@ def analyze_today_orders(order_preview, orders_db, customer_df, black_df):
     return result, detail
 
 
+
+def style_customer_crm_table(df):
+    if df is None or df.empty:
+        return df
+
+    def row_style(row):
+        black = str(row.get("black_status", row.get("status", "")))
+        grade_val = str(row.get("grade", ""))
+        order_count = int(row.get("order_count", 0)) if pd.notna(row.get("order_count", 0)) else 0
+
+        if black == "블랙":
+            return ["background-color: #111827; color: white; font-weight: 700"] * len(row)
+        if black == "주의":
+            return ["background-color: #fee2e2"] * len(row)
+        if grade_val == "VIP" or order_count >= 5:
+            return ["background-color: #fef3c7"] * len(row)
+        if order_count >= 2:
+            return ["background-color: #ffedd5"] * len(row)
+        return ["background-color: #dcfce7"] * len(row)
+
+    return df.style.apply(row_style, axis=1)
+
 def style_today_customer_table(df):
     """오늘 주문 분석 표 색상"""
     if df is None or df.empty:
@@ -639,6 +662,113 @@ def style_today_customer_table(df):
         return [""] * len(row)
 
     return df.style.apply(row_style, axis=1)
+
+
+def make_ai_context(customer_df, orders_db):
+    """AI에게 넘길 CRM 요약. 개인정보 과다 노출 방지를 위해 집계 중심."""
+    if customer_df is None or customer_df.empty:
+        return "저장된 고객 데이터가 없습니다."
+
+    total_orders = len(orders_db) if orders_db is not None else 0
+    total_customers = len(customer_df)
+    repeat_customers = int((customer_df["order_count"] >= 2).sum()) if "order_count" in customer_df.columns else 0
+    vip_customers = int((customer_df["order_count"] >= 5).sum()) if "order_count" in customer_df.columns else 0
+    repeat_rate = round(repeat_customers / total_customers * 100, 1) if total_customers else 0
+
+    top_customers = customer_df.sort_values("order_count", ascending=False).head(10)
+    top_amount = customer_df.sort_values("total_amount", ascending=False).head(10) if "total_amount" in customer_df.columns else pd.DataFrame()
+
+    product_text = ""
+    if orders_db is not None and not orders_db.empty and "product_names" in orders_db.columns:
+        product_counts = orders_db["product_names"].astype(str).value_counts().head(10)
+        product_text = "\\n".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
+
+    top_customer_text = "\\n".join([
+        f"- {r.get('customer_name','')} / {int(r.get('order_count',0))}회 / {int(r.get('total_amount',0)):,}원"
+        for _, r in top_customers.iterrows()
+    ])
+
+    top_amount_text = "\\n".join([
+        f"- {r.get('customer_name','')} / {int(r.get('total_amount',0)):,}원 / {int(r.get('order_count',0))}회"
+        for _, r in top_amount.iterrows()
+    ]) if not top_amount.empty else ""
+
+    return f"""
+식혜명가 CRM 요약:
+- 누적 주문수: {total_orders:,}건
+- 누적 고객수: {total_customers:,}명
+- 재구매 고객수: {repeat_customers:,}명
+- 재구매율: {repeat_rate}%
+- VIP 고객수(5회 이상): {vip_customers:,}명
+
+주문횟수 상위 고객:
+{top_customer_text}
+
+누적금액 상위 고객:
+{top_amount_text}
+
+주요 상품 빈도:
+{product_text}
+"""
+
+
+def ask_ai_crm(question, customer_df, orders_db):
+    """OpenAI 또는 Gemini 선택 사용. 키가 없으면 안내."""
+    context = make_ai_context(customer_df, orders_db)
+
+    system_prompt = """
+너는 식혜 온라인 판매자의 CRM 분석 비서다.
+답변은 한국어로, 짧고 실무적으로 한다.
+고객 개인정보를 불필요하게 길게 노출하지 말고, 마케팅/재구매/고객관리 관점에서 답한다.
+정확한 숫자는 제공된 CRM 요약 안에서만 사용한다.
+"""
+
+    provider = st.secrets.get("AI_PROVIDER", "openai").lower()
+
+    if provider == "gemini":
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        model = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+        if not api_key:
+            return "GEMINI_API_KEY가 Secrets에 없습니다."
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": system_prompt + "\\n\\n" + context + "\\n\\n사용자 질문: " + question
+                }]
+            }]
+        }
+        res = requests.post(url, json=payload, timeout=60)
+        if res.status_code >= 400:
+            return f"Gemini API 오류: {res.status_code} / {res.text[:500]}"
+        data = res.json()
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            return str(data)
+
+    else:
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
+        model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+        if not api_key:
+            return "OPENAI_API_KEY가 Secrets에 없습니다. Gemini를 쓰려면 AI_PROVIDER='gemini'와 GEMINI_API_KEY를 넣으세요."
+
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": context + "\\n\\n질문: " + question},
+            ],
+            "temperature": 0.3,
+        }
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        if res.status_code >= 400:
+            return f"OpenAI API 오류: {res.status_code} / {res.text[:500]}"
+        data = res.json()
+        return data["choices"][0]["message"]["content"]
 
 # =========================
 # 앱 시작
@@ -664,8 +794,8 @@ with st.expander("사용법"):
 4. 블랙리스트 탭에서 고객별 주의/블랙 사유를 저장할 수 있습니다.
     """)
 
-tab_upload, tab_today, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_black, tab_orders, tab_download = st.tabs([
-    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
+tab_upload, tab_today, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_orders, tab_download = st.tabs([
+    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🤖 AI CRM 비서", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
 ])
 
 if "today_order_preview" not in st.session_state:
@@ -810,6 +940,9 @@ else:
     customer_df["result"] = ""
 
 customer_df["black_status"] = customer_df["status"].fillna("정상").replace("", "정상")
+customer_df["총주문금액"] = customer_df["total_amount"]
+customer_df["건당평균금액"] = customer_df["avg_order_amount"]
+
 
 with tab_today:
     st.subheader("🔥 오늘 주문 분석")
@@ -907,13 +1040,44 @@ with tab_dashboard:
         st.bar_chart(bucket.value_counts().reindex(["1회", "2회", "3회", "4회 이상"]).fillna(0))
 
 with tab_customers:
-    st.subheader("고객 CRM")
-    grades = st.multiselect("고객등급", sorted(customer_df["grade"].unique()), default=sorted(customer_df["grade"].unique()))
-    black_statuses = st.multiselect("블랙상태", sorted(customer_df["black_status"].unique()), default=sorted(customer_df["black_status"].unique()))
+    st.subheader("👤 고객 CRM")
+    st.caption("이름/전화번호/주소/상품명으로 검색하고, VIP·재구매·블랙 고객을 색상으로 확인합니다.")
 
-    view = customer_df[(customer_df["grade"].isin(grades)) & (customer_df["black_status"].isin(black_statuses))]
-    view = view.sort_values(["order_count", "last_order_date"], ascending=[False, False])
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    search = st.text_input("통합 검색", placeholder="예: 고객명, 전화번호, 주소, 상품명")
+    grade_options = sorted(customer_df["grade"].dropna().unique())
+    selected_grades = st.multiselect("고객등급", grade_options, default=grade_options)
+
+    black_options = sorted(customer_df["black_status"].dropna().unique())
+    selected_black = st.multiselect("블랙상태", black_options, default=black_options)
+
+    view = customer_df[
+        (customer_df["grade"].isin(selected_grades)) &
+        (customer_df["black_status"].isin(selected_black))
+    ].copy()
+
+    if search:
+        search_mask = (
+            view["customer_name"].astype(str).str.contains(search, case=False, na=False)
+            | view["phone"].astype(str).str.contains(search, case=False, na=False)
+            | view["address"].astype(str).str.contains(search, case=False, na=False)
+            | view["products"].astype(str).str.contains(search, case=False, na=False)
+        )
+        view = view[search_mask]
+
+    sort_col = st.selectbox("정렬", ["order_count", "total_amount", "last_order_date", "avg_order_amount"], index=0)
+    view = view.sort_values(sort_col, ascending=False)
+
+    show_cols = [
+        "customer_name", "phone", "address", "grade", "black_status",
+        "order_count", "total_amount", "avg_order_amount",
+        "first_order_date", "last_order_date", "channels", "products"
+    ]
+    show_cols = [c for c in show_cols if c in view.columns]
+
+    st.dataframe(style_customer_crm_table(view[show_cols]), use_container_width=True, hide_index=True, height=520)
+
+    st.info("상세 주문내역은 `🔎 고객 상세` 탭에서 고객을 선택하면 볼 수 있습니다.")
+
 
 
 with tab_detail:
@@ -946,11 +1110,13 @@ with tab_detail:
         selected = customer_view[customer_view["label"] == selected_label].iloc[0]
         key = selected["analysis_customer_key"]
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("주문횟수", f"{int(selected['order_count']):,}회")
         c2.metric("등급", str(selected["grade"]))
-        c3.metric("첫 주문일", str(pd.to_datetime(selected["first_order_date"]).date()))
-        c4.metric("최근 주문일", str(pd.to_datetime(selected["last_order_date"]).date()))
+        c3.metric("총 주문금액", f"{int(selected.get('total_amount', 0)):,}원")
+        c4.metric("건당 평균금액", f"{int(selected.get('avg_order_amount', 0)):,}원")
+        c5.metric("첫 주문일", str(pd.to_datetime(selected["first_order_date"]).date()))
+        c6.metric("최근 주문일", str(pd.to_datetime(selected["last_order_date"]).date()))
 
         st.write("고객정보")
         info_df = pd.DataFrame([{
@@ -962,14 +1128,25 @@ with tab_detail:
         }])
         st.dataframe(info_df, use_container_width=True, hide_index=True)
 
-        st.write("고객 메모")
+        st.write("고객 메모 / 태그")
         notes_df = fetch_customer_notes()
         old_memo = ""
         if not notes_df.empty and key in notes_df["customer_key"].astype(str).values:
             old_memo = notes_df[notes_df["customer_key"].astype(str) == str(key)]["memo"].iloc[0]
+
+        tag_options = [
+            "단호박매니아", "식혜매니아", "혼합구매", "대량주문", "소량주문",
+            "신규", "재구매", "VIP", "VVIP",
+            "쿠폰반응", "행사반응", "선물용", "재구매유도",
+            "CS주의", "배송주의", "블랙",
+            "회사구매", "학교구매", "단체구매"
+        ]
+        selected_tags = st.multiselect("고객 태그", tag_options)
         memo_input = st.text_area("메모 입력", value=old_memo, placeholder="예: 단호박 선호 / 행사 대량주문 / CS 주의")
+        save_text = "[태그] " + ", ".join(selected_tags) + "\n" + memo_input if selected_tags else memo_input
+
         if st.button("고객 메모 저장", type="primary"):
-            save_customer_note(key, selected["customer_name"], selected["phone"], selected["address"], memo_input)
+            save_customer_note(key, selected["customer_name"], selected["phone"], selected["address"], save_text)
             st.success("고객 메모 저장 완료")
 
         st.write("전체 주문내역")
@@ -989,6 +1166,46 @@ with tab_vip:
     b.metric("최고 주문횟수", f"{int(vip_df['order_count'].max()) if not vip_df.empty else 0:,}회")
 
     st.dataframe(vip_df, use_container_width=True, hide_index=True)
+
+
+
+with tab_ai:
+    st.subheader("🤖 AI CRM 비서")
+    st.caption("CRM 데이터를 요약해서 AI에게 질문합니다. OpenAI 또는 Gemini API Key를 Streamlit Secrets에 넣으면 작동합니다.")
+
+    st.markdown("""
+    **Secrets 예시**
+    ```toml
+    AI_PROVIDER = "openai"
+    OPENAI_API_KEY = "sk-..."
+    OPENAI_MODEL = "gpt-4o-mini"
+    ```
+    또는
+    ```toml
+    AI_PROVIDER = "gemini"
+    GEMINI_API_KEY = "..."
+    GEMINI_MODEL = "gemini-1.5-flash"
+    ```
+    """)
+
+    quick_q = st.selectbox(
+        "빠른 질문",
+        [
+            "현재 CRM 상태를 짧게 분석해줘",
+            "재구매율을 높이려면 뭘 하면 좋을까?",
+            "VIP 고객 관리 전략을 추천해줘",
+            "오늘 주문 분석 결과에서 주의할 점을 알려줘",
+            "마케팅 문자 보낼 고객 기준을 추천해줘",
+        ],
+    )
+
+    custom_q = st.text_area("직접 질문", placeholder="예: 3회 이상 구매 고객에게 어떤 이벤트를 하면 좋을까?")
+    question = custom_q.strip() if custom_q.strip() else quick_q
+
+    if st.button("AI 분석 실행", type="primary"):
+        with st.spinner("AI가 CRM 데이터를 분석 중입니다..."):
+            answer = ask_ai_crm(question, customer_df, orders_db)
+        st.markdown(answer)
 
 
 with tab_black:
