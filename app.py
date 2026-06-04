@@ -373,14 +373,35 @@ def upsert_orders(order_level):
             "updated_at": now,
         })
 
-    # 대량 저장 시 Supabase/PostgREST 요청 크기 제한에 걸리지 않도록 나눠서 저장
-    chunk_size = 700
+    # 같은 주문번호가 여러 파일에 중복 업로드돼도 DB 저장 전에 1개만 남김
+    dedup = {}
+    for rec in records:
+        dedup[rec["order_key"]] = rec
+    records = list(dedup.values())
+
+    def save_chunk_safely(chunk):
+        """큰 묶음 저장 실패 시 자동으로 반씩 쪼개 저장"""
+        if not chunk:
+            return 0
+
+        try:
+            sb.table("orders").upsert(chunk, on_conflict="order_key").execute()
+            return len(chunk)
+        except Exception as e:
+            if len(chunk) <= 1:
+                # 어떤 주문 1건 자체가 문제일 때만 화면에 명확히 표시
+                raise RuntimeError(f"저장 실패 주문: {chunk[0].get('order_key')} / 원인: {e}")
+
+            mid = len(chunk) // 2
+            return save_chunk_safely(chunk[:mid]) + save_chunk_safely(chunk[mid:])
+
+    # 기본은 1000건씩 시도, 실패하면 자동 분할
+    chunk_size = 1000
     saved_count = 0
 
     for i in range(0, len(records), chunk_size):
         chunk = records[i:i + chunk_size]
-        sb.table("orders").upsert(chunk, on_conflict="order_key").execute()
-        saved_count += len(chunk)
+        saved_count += save_chunk_safely(chunk)
 
     return saved_count
 
@@ -724,7 +745,7 @@ with tab_upload:
             with col_save:
                 if st.button("DB에 저장하기", type="primary", use_container_width=True):
                     saved = upsert_orders(order_preview)
-                    st.success(f"{saved:,}건 저장 완료. 대량 자료는 700건씩 나눠 안전하게 저장했습니다. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
+                    st.success(f"{saved:,}건 저장 완료. 대량 자료는 1000건씩 시도하고, 실패 시 자동으로 더 작게 나눠 저장했습니다. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
                     st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
             with col_clear:
                 if st.button("화면 분석 결과 초기화", use_container_width=True):
