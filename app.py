@@ -712,6 +712,25 @@ def make_ai_context(customer_df, orders_db):
 """
 
 
+
+def auto_ai_crm_analysis(customer_df, orders_db):
+    """버튼 한 번으로 CRM 자동 분석"""
+    question = """
+현재 CRM 데이터를 바탕으로 아래 항목을 실무적으로 분석해줘.
+
+1. 현재 고객 구조 요약
+2. 재구매율 상태 평가
+3. VIP 고객 관리 포인트
+4. 신규 고객을 재구매로 전환하기 위한 전략
+5. 당장 실행할 마케팅 액션 TOP 5
+6. 문자/쿠폰을 보낸다면 어떤 고객군을 우선해야 하는지
+7. 사장님이 이번 주에 확인해야 할 체크리스트
+
+답변은 너무 길지 않게, 바로 실행 가능한 형태로 정리해줘.
+"""
+    return ask_ai_crm(question, customer_df, orders_db)
+
+
 def ask_ai_crm(question, customer_df, orders_db):
     """OpenAI 또는 Gemini 선택 사용. 키가 없으면 안내."""
     context = make_ai_context(customer_df, orders_db)
@@ -1026,6 +1045,13 @@ with tab_dashboard:
             st.markdown(f'<div class="kpi-card"><div class="kpi-title">{title}</div><div class="kpi-value">{val}</div></div>', unsafe_allow_html=True)
 
     st.write("")
+    with st.expander("🤖 AI 자동 분석 바로 실행", expanded=False):
+        st.caption("AI API Key가 연결되어 있으면 현재 CRM 상태를 자동 분석합니다.")
+        if st.button("대시보드에서 AI 분석 실행"):
+            with st.spinner("AI 분석 중..."):
+                st.markdown(auto_ai_crm_analysis(customer_df, orders_db))
+
+    st.write("")
     left, right = st.columns(2)
 
     with left:
@@ -1188,6 +1214,17 @@ with tab_ai:
     ```
     """)
 
+    st.markdown("### 🚀 자동 CRM 분석")
+    st.caption("현재 저장된 CRM 데이터를 AI가 자동으로 요약하고, 이번 주 실행할 액션까지 제안합니다.")
+
+    if st.button("자동 CRM 분석 실행", type="primary", use_container_width=True):
+        with st.spinner("AI가 전체 CRM을 자동 분석 중입니다..."):
+            answer = auto_ai_crm_analysis(customer_df, orders_db)
+        st.markdown(answer)
+
+    st.divider()
+
+    st.markdown("### 💬 직접 질문")
     quick_q = st.selectbox(
         "빠른 질문",
         [
@@ -1196,13 +1233,15 @@ with tab_ai:
             "VIP 고객 관리 전략을 추천해줘",
             "오늘 주문 분석 결과에서 주의할 점을 알려줘",
             "마케팅 문자 보낼 고객 기준을 추천해줘",
+            "2회 구매 고객을 3회 구매로 전환하는 방법을 알려줘",
+            "VIP 고객에게 보낼 문자 문구를 작성해줘",
         ],
     )
 
-    custom_q = st.text_area("직접 질문", placeholder="예: 3회 이상 구매 고객에게 어떤 이벤트를 하면 좋을까?")
+    custom_q = st.text_area("직접 질문", placeholder="예: 3회 이상 구매고객에게 어떤 이벤트를 하면 좋을까?")
     question = custom_q.strip() if custom_q.strip() else quick_q
 
-    if st.button("AI 분석 실행", type="primary"):
+    if st.button("AI에게 질문하기", use_container_width=True):
         with st.spinner("AI가 CRM 데이터를 분석 중입니다..."):
             answer = ask_ai_crm(question, customer_df, orders_db)
         st.markdown(answer)
