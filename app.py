@@ -707,7 +707,7 @@ def style_today_customer_table(df):
             return ["background-color: #dbeafe"] * len(row)
         if "🟢" in status:
             return ["background-color: #dcfce7; color: #111827; font-weight: 600"] * len(row)
-        return ["color: #111827"] * len(row)
+        return [""] * len(row)
 
     return df.style.apply(row_style, axis=1)
 
@@ -719,6 +719,7 @@ def make_ai_context(customer_df, orders_db):
 
     total_orders = len(orders_db) if orders_db is not None else 0
     total_customers = len(customer_df)
+
     repeat_customers = int((customer_df["order_count"] >= 2).sum()) if "order_count" in customer_df.columns else 0
     vip_customers = int((customer_df["order_count"] >= 5).sum()) if "order_count" in customer_df.columns else 0
     repeat_rate = round(repeat_customers / total_customers * 100, 1) if total_customers else 0
@@ -727,18 +728,22 @@ def make_ai_context(customer_df, orders_db):
     two_time = int((customer_df["order_count"] == 2).sum()) if "order_count" in customer_df.columns else 0
     three_plus = int((customer_df["order_count"] >= 3).sum()) if "order_count" in customer_df.columns else 0
 
-    top_order_counts = customer_df["order_count"].value_counts().sort_index().head(20).to_dict() if "order_count" in customer_df.columns else {}
+    if "order_count" in customer_df.columns:
+        top_order_counts = customer_df["order_count"].value_counts().sort_index().head(20).to_dict()
+    else:
+        top_order_counts = {}
 
     product_text = ""
     if orders_db is not None and not orders_db.empty and "product_names" in orders_db.columns:
         product_counts = orders_db["product_names"].astype(str).value_counts().head(10)
-       product_text = "\n".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
+        product_text = "\n".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
+
     monthly_text = ""
     if orders_db is not None and not orders_db.empty and "order_date" in orders_db.columns:
         temp = orders_db.copy()
         temp["월"] = pd.to_datetime(temp["order_date"], errors="coerce", utc=True).dt.to_period("M").astype(str)
         monthly = temp.groupby("월").size().tail(12)
-monthly_text = "\n".join([f"- {idx}: {val}건" for idx, val in monthly.items()])
+        monthly_text = "\n".join([f"- {idx}: {val}건" for idx, val in monthly.items()])
 
     return f"""
 식혜명가 CRM 집계 요약:
