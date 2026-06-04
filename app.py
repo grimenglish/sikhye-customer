@@ -1,5 +1,4 @@
 
-
 import io
 import re
 from datetime import datetime, date
@@ -290,12 +289,14 @@ def make_customer_df(order_level):
         .reset_index()
     )
 
-    today = pd.Timestamp.today().normalize()
+    # Supabase timestamptz는 timezone-aware 값으로 들어오므로 UTC 기준으로 통일
+    today = pd.Timestamp.now(tz="UTC").normalize()
     customer["grade"] = customer["order_count"].apply(grade)
     customer["customer_type"] = customer["order_count"].apply(lambda x: "재구매" if x >= 2 else "신규")
-    customer["days_since_last_order"] = (today - pd.to_datetime(customer["last_order_date"]).dt.normalize()).dt.days
+    last_order = pd.to_datetime(customer["last_order_date"], utc=True, errors="coerce").dt.normalize()
+    customer["days_since_last_order"] = (today - last_order).dt.days.fillna(0).astype(int)
     customer["churn_status"] = customer["days_since_last_order"].apply(churn)
-    customer["avg_order_amount"] = (customer["total_amount"] / customer["order_count"]).round(0).astype(int)
+    customer["avg_order_amount"] = (customer["total_amount"] / customer["order_count"]).round(0).fillna(0).astype(int)
     return customer
 
 
@@ -620,5 +621,3 @@ with tab_download:
         file_name=f"sikhye_saved_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
