@@ -74,6 +74,15 @@ st.markdown("""
     margin: 12px 0;
 }
 
+
+/* 모바일/다크모드 표 가독성 보정 */
+[data-testid="stDataFrame"] {
+    background: #ffffff !important;
+}
+[data-testid="stDataFrame"] div {
+    font-size: 13px;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -670,14 +679,14 @@ def style_customer_crm_table(df):
         order_count = int(row.get("order_count", 0)) if pd.notna(row.get("order_count", 0)) else 0
 
         if black == "블랙":
-            return ["background-color: #111827; color: white; font-weight: 700"] * len(row)
+            return ["background-color: #000000; color: #ffffff; font-weight: 800"] * len(row)
         if black == "주의":
-            return ["background-color: #fee2e2"] * len(row)
+            return ["background-color: #fee2e2; color: #111827; font-weight: 600"] * len(row)
         if grade_val == "VIP" or order_count >= 5:
-            return ["background-color: #fef3c7"] * len(row)
+            return ["background-color: #fef3c7; color: #111827; font-weight: 700"] * len(row)
         if order_count >= 2:
-            return ["background-color: #ffedd5"] * len(row)
-        return ["background-color: #dcfce7"] * len(row)
+            return ["background-color: #ffedd5; color: #111827; font-weight: 600"] * len(row)
+        return ["background-color: #dcfce7; color: #111827; font-weight: 600"] * len(row)
 
     return df.style.apply(row_style, axis=1)
 
@@ -691,14 +700,14 @@ def style_today_customer_table(df):
         black = str(row.get("블랙상태", ""))
 
         if "🔴" in status or black in ["주의", "블랙"]:
-            return ["background-color: #fee2e2"] * len(row)
+            return ["background-color: #fee2e2; color: #111827; font-weight: 600"] * len(row)
         if "🟡" in status:
-            return ["background-color: #fef3c7"] * len(row)
+            return ["background-color: #fef3c7; color: #111827; font-weight: 700"] * len(row)
         if "🔵" in status:
             return ["background-color: #dbeafe"] * len(row)
         if "🟢" in status:
-            return ["background-color: #dcfce7"] * len(row)
-        return [""] * len(row)
+            return ["background-color: #dcfce7; color: #111827; font-weight: 600"] * len(row)
+        return ["color: #111827"] * len(row)
 
     return df.style.apply(row_style, axis=1)
 
