@@ -83,31 +83,6 @@ st.markdown("""
     font-size: 13px;
 }
 
-
-.dashboard-card {
-    background: #ffffff;
-    border: 1px solid #e5e7eb;
-    border-radius: 18px;
-    padding: 18px 20px;
-    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
-}
-.dashboard-big {
-    font-size: 30px;
-    font-weight: 900;
-    color: #111827;
-}
-.dashboard-small {
-    font-size: 13px;
-    color: #6b7280;
-}
-.insight-box {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 16px;
-    padding: 16px 18px;
-    margin: 8px 0 16px 0;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -875,50 +850,110 @@ def ask_ai_crm(question, customer_df, orders_db):
 
 
 
-def make_customer_funnel(customer_df):
-    """구매 단계별 고객 구조"""
-    if customer_df is None or customer_df.empty:
-        return pd.DataFrame(columns=["구매단계", "고객수"])
+def infer_shipping_item(product_name):
+    """상품명에서 품목/개입수를 추정"""
+    name = str(product_name)
 
-    return pd.DataFrame({
-        "구매단계": ["1회 구매", "2회 구매", "3회 구매", "4회 이상", "VIP 5회+"],
-        "고객수": [
-            int((customer_df["order_count"] == 1).sum()),
-            int((customer_df["order_count"] == 2).sum()),
-            int((customer_df["order_count"] == 3).sum()),
-            int((customer_df["order_count"] >= 4).sum()),
-            int((customer_df["order_count"] >= 5).sum()),
-        ],
-    })
+    # 개입수: 2개, 2개입, 2병, 2팩 등
+    unit_count = 1
+    m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', name)
+    if m:
+        try:
+            unit_count = int(m.group(1))
+        except Exception:
+            unit_count = 1
+
+    # 용량
+    upper = name.upper()
+    if "500" in name or "500ML" in upper:
+        size = "500ml"
+    elif "1L" in upper or "1리터" in name or "1ℓ" in name:
+        size = "1L"
+    else:
+        size = "기타"
+
+    # 종류
+    if "단호박" in name or "호박" in name:
+        kind = "단호박식혜"
+    else:
+        kind = "식혜"
+
+    return f"{kind} {size}", unit_count
 
 
-def make_dashboard_insights(customer_df, orders_db):
-    """대시보드용 짧은 인사이트"""
-    if customer_df is None or customer_df.empty:
-        return []
+def make_shipping_summary(order_level):
+    """업로드 주문 기준 오늘 출고 총합"""
+    if order_level is None or order_level.empty:
+        return pd.DataFrame(columns=["품목", "실제출고수량", "주문수량", "상품종류수"])
 
-    total_customers = len(customer_df)
-    repeat_customers = int((customer_df["order_count"] >= 2).sum())
-    vip_customers = int((customer_df["order_count"] >= 5).sum())
-    one_time = int((customer_df["order_count"] == 1).sum())
-    repeat_rate = repeat_customers / total_customers * 100 if total_customers else 0
+    rows = []
+    for _, r in order_level.iterrows():
+        product = str(r.get("product_names", ""))
+        qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
+        item, unit_count = infer_shipping_item(product)
 
-    insights = [
-        f"재구매율은 현재 {repeat_rate:.1f}%입니다.",
-        f"1회 구매 고객이 {one_time:,}명입니다. 이 고객군을 2회 구매로 전환하는 것이 핵심입니다.",
-        f"VIP 고객은 {vip_customers:,}명입니다. 감사문자/재구매 이벤트 대상으로 따로 관리하는 것이 좋습니다.",
-    ]
+        rows.append({
+            "품목": item,
+            "상품명": product,
+            "주문수량": qty,
+            "개입수": unit_count,
+            "실제출고수량": qty * unit_count,
+        })
 
-    if orders_db is not None and not orders_db.empty:
-        temp = orders_db.copy()
-        temp["월"] = pd.to_datetime(temp["order_date"], errors="coerce").dt.to_period("M").astype(str)
-        monthly = temp.groupby("월").size().tail(2)
-        if len(monthly) >= 2:
-            prev, curr = monthly.iloc[-2], monthly.iloc[-1]
-            diff = curr - prev
-            insights.append(f"최근월 주문은 전월보다 {diff:,}건 {'증가' if diff >= 0 else '감소'}했습니다.")
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["품목", "실제출고수량", "주문수량", "상품종류수"])
 
-    return insights
+    return (
+        df.groupby("품목", dropna=False)
+        .agg(
+            실제출고수량=("실제출고수량", "sum"),
+            주문수량=("주문수량", "sum"),
+            상품종류수=("상품명", "nunique"),
+        )
+        .reset_index()
+        .sort_values("실제출고수량", ascending=False)
+    )
+
+
+def make_weekly_shipping_average(orders_db, weeks=8):
+    """최근 N주 기준 품목별 주간 평균 출고량"""
+    if orders_db is None or orders_db.empty:
+        return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
+
+    df = orders_db.copy()
+    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+    df = df.dropna(subset=["order_date"])
+
+    if df.empty:
+        return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
+
+    max_date = df["order_date"].max()
+    start_date = max_date - pd.Timedelta(weeks=weeks)
+    df = df[df["order_date"] >= start_date]
+
+    rows = []
+    for _, r in df.iterrows():
+        product = str(r.get("product_names", ""))
+        qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
+        item, unit_count = infer_shipping_item(product)
+        rows.append({
+            "품목": item,
+            "실제출고수량": qty * unit_count,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
+
+    summary = (
+        out.groupby("품목", dropna=False)
+        .agg(최근총출고수량=("실제출고수량", "sum"))
+        .reset_index()
+    )
+    summary["분석주수"] = weeks
+    summary["최근주간평균출고수량"] = (summary["최근총출고수량"] / weeks).round(1)
+    return summary[["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"]].sort_values("최근주간평균출고수량", ascending=False)
 
 
 # =========================
@@ -1157,9 +1192,6 @@ with tab_today:
 
 
 with tab_dashboard:
-    st.subheader("📊 대시보드")
-    st.caption("핵심 지표와 고객 구조를 한눈에 보는 화면입니다.")
-
     total_orders = len(orders_db)
     total_customers = len(customer_df)
     repeat_customers = int((customer_df["order_count"] >= 2).sum())
@@ -1167,70 +1199,38 @@ with tab_dashboard:
     vip_count = int((customer_df["order_count"] >= 5).sum())
     black_count = int((customer_df["black_status"].isin(["주의", "블랙"])).sum())
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    kpis = [
-        (k1, "누적 주문", f"{total_orders:,}건", "전체 저장 주문"),
-        (k2, "누적 고객", f"{total_customers:,}명", "고객 기준 집계"),
-        (k3, "재구매 고객", f"{repeat_customers:,}명", "2회 이상 구매"),
-        (k4, "재구매율", f"{repeat_rate:.1f}%", "재구매 고객 / 전체"),
-        (k5, "VIP", f"{vip_count:,}명", "5회 이상 구매"),
-    ]
-
-    for col, title, value, desc in kpis:
+    cols = st.columns(6)
+    for col, (title, val) in zip(cols, [
+        ("누적 주문", f"{total_orders:,}건"),
+        ("누적 고객", f"{total_customers:,}명"),
+        ("재구매 고객", f"{repeat_customers:,}명"),
+        ("재구매율", f"{repeat_rate:.1f}%"),
+        ("VIP", f"{vip_count:,}명"),
+        ("주의/블랙", f"{black_count:,}명"),
+    ]):
         with col:
-            card_html = (
-                '<div class="dashboard-card">'
-                f'<div class="dashboard-small">{title}</div>'
-                f'<div class="dashboard-big">{value}</div>'
-                f'<div class="dashboard-small">{desc}</div>'
-                '</div>'
-            )
-            st.markdown(card_html, unsafe_allow_html=True)
+            st.markdown(f'<div class="kpi-card"><div class="kpi-title">{title}</div><div class="kpi-value">{val}</div></div>', unsafe_allow_html=True)
 
     st.write("")
-
-    insights = make_dashboard_insights(customer_df, orders_db)
-    insight_html = '<div class="insight-box"><b>오늘의 CRM 체크포인트</b><br>' + "<br>".join([f"• {x}" for x in insights]) + "</div>"
-    st.markdown(insight_html, unsafe_allow_html=True)
-
     with st.expander("🤖 AI 자동 분석 바로 실행", expanded=False):
         st.caption("AI API Key가 연결되어 있으면 현재 CRM 상태를 자동 분석합니다.")
         if st.button("대시보드에서 AI 분석 실행"):
             with st.spinner("AI 분석 중..."):
                 st.markdown(auto_ai_crm_analysis(customer_df, orders_db))
 
+    st.write("")
     left, right = st.columns(2)
 
     with left:
-        st.subheader("월별 주문 흐름")
+        st.subheader("월별 누적 주문")
         monthly = orders_db.copy()
-        monthly["월"] = pd.to_datetime(monthly["order_date"], errors="coerce").dt.to_period("M").astype(str)
-        monthly_chart = monthly.groupby("월").size().reset_index(name="주문수").tail(18)
-        st.bar_chart(monthly_chart.set_index("월"))
+        monthly["월"] = pd.to_datetime(monthly["order_date"]).dt.to_period("M").astype(str)
+        st.bar_chart(monthly.groupby("월").size())
 
     with right:
-        st.subheader("고객 구매 단계")
-        funnel = make_customer_funnel(customer_df)
-        st.bar_chart(funnel.set_index("구매단계"))
-
-    st.subheader("관리 우선 고객")
-    col_a, col_b, col_c = st.columns(3)
-
-    with col_a:
-        st.markdown("#### ⭐ VIP 상위")
-        vip_view = customer_df.sort_values(["order_count", "total_amount"], ascending=[False, False]).head(10)
-        st.dataframe(vip_view[["customer_name", "phone", "order_count", "total_amount"]], use_container_width=True, hide_index=True)
-
-    with col_b:
-        st.markdown("#### 💰 큰손 고객")
-        amount_view = customer_df.sort_values("total_amount", ascending=False).head(10)
-        st.dataframe(amount_view[["customer_name", "phone", "order_count", "total_amount"]], use_container_width=True, hide_index=True)
-
-    with col_c:
-        st.markdown("#### 🆕 1회 구매 고객")
-        one_view = customer_df[customer_df["order_count"] == 1].sort_values("last_order_date", ascending=False).head(10)
-        st.dataframe(one_view[["customer_name", "phone", "last_order_date", "products"]], use_container_width=True, hide_index=True)
-
+        st.subheader("구매횟수별 고객")
+        bucket = customer_df["order_count"].apply(lambda x: "1회" if x == 1 else "2회" if x == 2 else "3회" if x == 3 else "4회 이상")
+        st.bar_chart(bucket.value_counts().reindex(["1회", "2회", "3회", "4회 이상"]).fillna(0))
 
 with tab_customers:
     st.subheader("👤 고객 CRM")
@@ -1269,7 +1269,39 @@ with tab_customers:
 
     st.dataframe(style_customer_crm_table(view[show_cols]), use_container_width=True, hide_index=True, height=520)
 
-    st.info("상세 주문내역은 `🔎 고객 상세` 탭에서 고객을 선택하면 볼 수 있습니다.")
+    st.markdown("### 고객 CRM 구매이력 바로 확인")
+    if view.empty:
+        st.info("검색 결과가 없습니다.")
+    else:
+        history_options = view.copy()
+        history_options["history_label"] = (
+            history_options["customer_name"].astype(str)
+            + " | "
+            + history_options["phone"].astype(str)
+            + " | "
+            + history_options["order_count"].astype(str)
+            + "회"
+        )
+
+        selected_history_label = st.selectbox("구매이력 확인할 고객 선택", history_options["history_label"].tolist())
+        selected_history = history_options[history_options["history_label"] == selected_history_label].iloc[0]
+        selected_key = selected_history["analysis_customer_key"]
+
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("주문횟수", f"{int(selected_history['order_count']):,}회")
+        h2.metric("총 주문금액", f"{int(selected_history.get('total_amount', 0)):,}원")
+        h3.metric("건당 평균금액", f"{int(selected_history.get('avg_order_amount', 0)):,}원")
+        h4.metric("최근 주문일", str(pd.to_datetime(selected_history["last_order_date"]).date()))
+
+        notes_df = fetch_customer_notes()
+        memo_text = ""
+        if not notes_df.empty and selected_key in notes_df["customer_key"].astype(str).values:
+            memo_text = notes_df[notes_df["customer_key"].astype(str) == str(selected_key)]["memo"].iloc[0]
+        if memo_text:
+            st.markdown(f"**고객 메모**  \n{memo_text}")
+
+        history_df = orders_db[orders_db["analysis_customer_key"] == selected_key].sort_values("order_date", ascending=False)
+        st.dataframe(history_df, use_container_width=True, hide_index=True, height=300)
 
 
 
