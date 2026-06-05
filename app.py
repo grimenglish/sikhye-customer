@@ -83,6 +83,15 @@ st.markdown("""
     font-size: 13px;
 }
 
+
+/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
+[data-testid="stFileUploaderDropzone"] {
+    min-height: 130px !important;
+    border: 2px dashed #94a3b8 !important;
+    border-radius: 18px !important;
+    background: #f8fafc !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -277,8 +286,11 @@ def standardize(df, market, filename):
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
     product_base = safe_series(df, product_col, "").map(normalize_text)
     option_text = safe_series(df, option_col, "").map(normalize_text)
-    # 출고수량 계산은 옵션정보가 가장 정확하므로 옵션정보 우선
-    out["product_name"] = option_text.where(option_text.str.strip() != "", product_base)
+    # 네이버는 옵션정보가 정확하고, 쿠팡은 노출상품명이 정확함
+    if market == "네이버":
+        out["product_name"] = option_text.where(option_text.str.strip() != "", product_base)
+    else:
+        out["product_name"] = (product_base + " " + option_text).str.strip()
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
@@ -854,18 +866,23 @@ def ask_ai_crm(question, customer_df, orders_db):
 
 
 
-def infer_shipping_item(product_name):
-    """옵션정보 기준으로 품목/개입수 추정"""
+def infer_shipping_item(product_name, channel=""):
+    """채널별 상품명 기준으로 품목/개입수 추정"""
     text = str(product_name).strip()
+    channel = str(channel)
 
-    # '용량:' 뒤만 사용
-    m_opt = re.search(r'용량\s*:\s*(.*)', text)
-    if m_opt:
-        text = m_opt.group(1).strip()
+    # 네이버는 옵션정보의 '용량:' 뒤를 우선 사용
+    if channel == "네이버":
+        m_opt = re.search(r'용량\s*:\s*(.*)', text)
+        if m_opt:
+            text = m_opt.group(1).strip()
 
     upper = text.upper()
 
+    # 개입수 추정
     unit_count = 1
+
+    # 쿠팡/네이버 공통: 2개, 2개입, 2병, 2팩
     m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', text)
     if m:
         try:
@@ -873,32 +890,52 @@ def infer_shipping_item(product_name):
         except Exception:
             unit_count = 1
 
-    if "200" in text or "200ML" in upper:
+    # 쿠팡 상품명에 자주 나오는 표현 보정: 1L 2개 / 2개 1L / 2개입 1L
+    if channel == "쿠팡":
+        # 단호박/일반 구분은 쿠팡 노출상품명 기준
+        # 수량 컬럼은 주문 세트 수량이고, 상품명 안의 개수는 개입수
+        m2 = re.search(r'(?:1L|1리터|1000ml|1000ML).*?(\d+)\s*(개|병|팩)', text, flags=re.I)
+        if m2:
+            unit_count = int(m2.group(1))
+        m3 = re.search(r'(\d+)\s*(개|병|팩).*?(?:1L|1리터|1000ml|1000ML)', text, flags=re.I)
+        if m3:
+            unit_count = int(m3.group(1))
+
+    # 용량
+    if re.search(r'200\s*ML|200\s*ml|200미리|200', text):
         size = "200ml"
-    elif "500" in text or "500ML" in upper:
+    elif re.search(r'500\s*ML|500\s*ml|500미리|500', text):
         size = "500ml"
-    elif "1L" in upper or "1리터" in text or "1ℓ" in text:
+    elif re.search(r'1\s*L|1리터|1ℓ|1000\s*ML|1000\s*ml', text, flags=re.I):
         size = "1L"
     else:
         size = "기타"
 
+    # 종류
     kind = "단호박식혜" if ("단호박" in text or "호박" in text) else "식혜"
+
     return f"{kind} {size}", unit_count
 
 
 def make_shipping_summary(raw_orders):
-    """원본 상품행 기준 오늘 출고 총합"""
+    """원본 상품행 기준 오늘 출고 총합
+
+    네이버: 옵션정보 기준
+    쿠팡: 노출상품명 기준
+    """
     if raw_orders is None or raw_orders.empty:
         return pd.DataFrame(columns=["품목", "실제출고수량", "주문수량", "상품종류수"])
 
     rows = []
     for _, r in raw_orders.iterrows():
         product = str(r.get("product_name", ""))
+        channel = str(r.get("channel", ""))
         qty = int(r.get("quantity", 0)) if pd.notna(r.get("quantity", 0)) else 0
-        item, unit_count = infer_shipping_item(product)
+        item, unit_count = infer_shipping_item(product, channel)
 
         rows.append({
             "품목": item,
+            "채널": channel,
             "상품명": product,
             "주문수량": qty,
             "개입수": unit_count,
@@ -939,8 +976,9 @@ def make_weekly_shipping_average(orders_db, weeks=8):
     rows = []
     for _, r in df.iterrows():
         product = str(r.get("product_names", ""))
+        channel = str(r.get("channel", ""))
         qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
-        item, unit_count = infer_shipping_item(product)
+        item, unit_count = infer_shipping_item(product, channel)
         rows.append({"품목": item, "실제출고수량": qty * unit_count})
 
     out = pd.DataFrame(rows)
