@@ -83,6 +83,15 @@ st.markdown("""
     font-size: 13px;
 }
 
+
+/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
+[data-testid="stFileUploaderDropzone"] {
+    min-height: 130px !important;
+    border: 2px dashed #94a3b8 !important;
+    border-radius: 18px !important;
+    background: #f8fafc !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -259,6 +268,7 @@ def standardize(df, market, filename):
     buyer_col = pick_col(df, ["구매자명", "구매자", "주문자명"])
     buyer_phone_col = pick_col(df, ["구매자연락처", "구매자전화번호", "주문자연락처"])
     qty_col = pick_col(df, ["수량", "구매수(수량)", "구매수량"])
+    option_col = pick_col(df, ["옵션정보", "옵션명", "옵션값", "옵션내용"])
 
     out = pd.DataFrame(index=df.index)
     out["channel"] = market
@@ -274,7 +284,9 @@ def standardize(df, market, filename):
     out["buyer_name"] = safe_series(df, buyer_col, "").map(normalize_text)
     out["buyer_phone"] = safe_series(df, buyer_phone_col, "").map(normalize_phone)
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
-    out["product_name"] = safe_series(df, product_col, "").map(normalize_text)
+    product_base = safe_series(df, product_col, "").map(normalize_text)
+    option_text = safe_series(df, option_col, "").map(normalize_text)
+    out["product_name"] = (product_base + " " + option_text).str.strip()
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
@@ -1166,6 +1178,23 @@ with tab_today:
         - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
         - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
         """)
+
+        st.subheader("📦 오늘 출고 총합")
+        today_order_preview = st.session_state.get("today_order_preview", pd.DataFrame())
+        shipping_summary = make_shipping_summary(today_order_preview)
+
+        if shipping_summary.empty:
+            st.info("오늘 업로드된 주문이 없습니다.")
+        else:
+            st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
+
+        with st.expander("최근 주간 평균 출고량", expanded=False):
+            avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
+            weekly_avg = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
+            if weekly_avg.empty:
+                st.info("주간 평균 출고량 데이터가 없습니다.")
+            else:
+                st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
 
         filter_status = st.multiselect(
             "상태 필터",
