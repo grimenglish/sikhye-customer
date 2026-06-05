@@ -277,7 +277,7 @@ def standardize(df, market, filename):
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
     product_base = safe_series(df, product_col, "").map(normalize_text)
     option_text = safe_series(df, option_col, "").map(normalize_text)
-    # 네이버는 상품명에 단호박이 섞여 있어 일반 1L도 단호박으로 오분류될 수 있으므로 옵션정보를 우선 사용
+    # 출고수량 계산은 옵션정보가 가장 정확하므로 옵션정보 우선
     out["product_name"] = option_text.where(option_text.str.strip() != "", product_base)
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
@@ -886,15 +886,15 @@ def infer_shipping_item(product_name):
     return f"{kind} {size}", unit_count
 
 
-def make_shipping_summary(order_level):
-    """업로드 주문 기준 오늘 출고 총합"""
-    if order_level is None or order_level.empty:
+def make_shipping_summary(raw_orders):
+    """원본 상품행 기준 오늘 출고 총합"""
+    if raw_orders is None or raw_orders.empty:
         return pd.DataFrame(columns=["품목", "실제출고수량", "주문수량", "상품종류수"])
 
     rows = []
-    for _, r in order_level.iterrows():
-        product = str(r.get("product_names", ""))
-        qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
+    for _, r in raw_orders.iterrows():
+        product = str(r.get("product_name", ""))
+        qty = int(r.get("quantity", 0)) if pd.notna(r.get("quantity", 0)) else 0
         item, unit_count = infer_shipping_item(product)
 
         rows.append({
@@ -922,14 +922,13 @@ def make_shipping_summary(order_level):
 
 
 def make_weekly_shipping_average(orders_db, weeks=8):
-    """최근 N주 기준 품목별 주간 평균 출고량"""
+    """최근 N주 기준 품목별 주간 평균 출고량. 저장 DB는 주문 단위라 참고용."""
     if orders_db is None or orders_db.empty:
         return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
 
     df = orders_db.copy()
     df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
     df = df.dropna(subset=["order_date"])
-
     if df.empty:
         return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
 
@@ -942,20 +941,13 @@ def make_weekly_shipping_average(orders_db, weeks=8):
         product = str(r.get("product_names", ""))
         qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
         item, unit_count = infer_shipping_item(product)
-        rows.append({
-            "품목": item,
-            "실제출고수량": qty * unit_count,
-        })
+        rows.append({"품목": item, "실제출고수량": qty * unit_count})
 
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
 
-    summary = (
-        out.groupby("품목", dropna=False)
-        .agg(최근총출고수량=("실제출고수량", "sum"))
-        .reset_index()
-    )
+    summary = out.groupby("품목", dropna=False).agg(최근총출고수량=("실제출고수량", "sum")).reset_index()
     summary["분석주수"] = weeks
     summary["최근주간평균출고수량"] = (summary["최근총출고수량"] / weeks).round(1)
     return summary[["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"]].sort_values("최근주간평균출고수량", ascending=False)
@@ -991,6 +983,8 @@ tab_upload, tab_today, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai
 
 if "today_order_preview" not in st.session_state:
     st.session_state["today_order_preview"] = pd.DataFrame()
+if "today_raw_orders" not in st.session_state:
+    st.session_state["today_raw_orders"] = pd.DataFrame()
 if "today_customer_analysis" not in st.session_state:
     st.session_state["today_customer_analysis"] = pd.DataFrame()
 if "today_detail_analysis" not in st.session_state:
@@ -1069,6 +1063,7 @@ with tab_upload:
             today_customer_analysis, today_detail_analysis = analyze_today_orders(
                 order_preview, orders_db_current, customer_df_current, black_df_current
             )
+            st.session_state["today_raw_orders"] = raw_orders
             st.session_state["today_order_preview"] = order_preview
             st.session_state["today_customer_analysis"] = today_customer_analysis
             st.session_state["today_detail_analysis"] = today_detail_analysis
@@ -1100,6 +1095,7 @@ with tab_upload:
                     st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
             with col_clear:
                 if st.button("화면 분석 결과 초기화", use_container_width=True):
+                    st.session_state["today_raw_orders"] = pd.DataFrame()
                     st.session_state["today_order_preview"] = pd.DataFrame()
                     st.session_state["today_customer_analysis"] = pd.DataFrame()
                     st.session_state["today_detail_analysis"] = pd.DataFrame()
@@ -1167,8 +1163,8 @@ with tab_today:
         """)
 
         st.subheader("📦 오늘 출고 총합")
-        today_order_preview = st.session_state.get("today_order_preview", pd.DataFrame())
-        shipping_summary = make_shipping_summary(today_order_preview)
+        today_raw_orders = st.session_state.get("today_raw_orders", pd.DataFrame())
+        shipping_summary = make_shipping_summary(today_raw_orders)
 
         if shipping_summary.empty:
             st.info("오늘 업로드된 주문이 없습니다.")
@@ -1291,39 +1287,7 @@ with tab_customers:
 
     st.dataframe(style_customer_crm_table(view[show_cols]), use_container_width=True, hide_index=True, height=520)
 
-    st.markdown("### 고객 CRM 구매이력 바로 확인")
-    if view.empty:
-        st.info("검색 결과가 없습니다.")
-    else:
-        history_options = view.copy()
-        history_options["history_label"] = (
-            history_options["customer_name"].astype(str)
-            + " | "
-            + history_options["phone"].astype(str)
-            + " | "
-            + history_options["order_count"].astype(str)
-            + "회"
-        )
-
-        selected_history_label = st.selectbox("구매이력 확인할 고객 선택", history_options["history_label"].tolist())
-        selected_history = history_options[history_options["history_label"] == selected_history_label].iloc[0]
-        selected_key = selected_history["analysis_customer_key"]
-
-        h1, h2, h3, h4 = st.columns(4)
-        h1.metric("주문횟수", f"{int(selected_history['order_count']):,}회")
-        h2.metric("총 주문금액", f"{int(selected_history.get('total_amount', 0)):,}원")
-        h3.metric("건당 평균금액", f"{int(selected_history.get('avg_order_amount', 0)):,}원")
-        h4.metric("최근 주문일", str(pd.to_datetime(selected_history["last_order_date"]).date()))
-
-        notes_df = fetch_customer_notes()
-        memo_text = ""
-        if not notes_df.empty and selected_key in notes_df["customer_key"].astype(str).values:
-            memo_text = notes_df[notes_df["customer_key"].astype(str) == str(selected_key)]["memo"].iloc[0]
-        if memo_text:
-            st.markdown(f"**고객 메모**  \n{memo_text}")
-
-        history_df = orders_db[orders_db["analysis_customer_key"] == selected_key].sort_values("order_date", ascending=False)
-        st.dataframe(history_df, use_container_width=True, hide_index=True, height=300)
+    st.info("상세 주문내역은 `🔎 고객 상세` 탭에서 고객을 선택하면 볼 수 있습니다.")
 
 
 
