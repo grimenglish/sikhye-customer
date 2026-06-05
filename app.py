@@ -712,103 +712,6 @@ def style_today_customer_table(df):
     return df.style.apply(row_style, axis=1)
 
 
-
-
-def detect_pack_count(product_name):
-    """상품명에서 2개세트/4개입 같은 개입수를 추정"""
-    text = normalize_text(product_name).lower()
-
-    # 1+1, 2+1 같은 표기는 총합으로 계산
-    plus_match = re.search(r'(\d+)\s*\+\s*(\d+)', text)
-    if plus_match:
-        return int(plus_match.group(1)) + int(plus_match.group(2))
-
-    # 2개, 2개입, 2병, 2팩, 2p, 2ea, 2입, 2구 등
-    matches = re.findall(r'(\d+)\s*(?:개입|개|병|팩|입|구|p|ea|세트)', text)
-    if matches:
-        # 상품명에 500ml 같은 숫자가 섞여도 단위가 ml/l이면 위 regex에는 안 걸림
-        nums = [int(x) for x in matches if int(x) <= 50]
-        if nums:
-            return max(nums)
-
-    # x2 / X2 표기
-    x_match = re.search(r'[xX×]\s*(\d+)', text)
-    if x_match:
-        return int(x_match.group(1))
-
-    return 1
-
-
-def classify_product(product_name):
-    """상품명을 출고 품목으로 자동 분류"""
-    text = normalize_text(product_name).lower()
-
-    is_pumpkin = any(k in text for k in ["단호박", "호박", "감주"])
-    is_500 = any(k in text for k in ["500ml", "500 ml", "0.5l", "500미리", "500"])
-    is_1l = any(k in text for k in ["1l", "1 l", "1000ml", "1000 ml", "1리터", "1리터", "1L".lower()])
-
-    if is_pumpkin and is_500:
-        return "단호박 500ml"
-    if is_pumpkin and is_1l:
-        return "단호박 1L"
-    if (not is_pumpkin) and is_500:
-        return "식혜 500ml"
-    if (not is_pumpkin) and is_1l:
-        return "식혜 1L"
-    if is_pumpkin:
-        return "단호박 기타"
-    if "식혜" in text:
-        return "식혜 기타"
-    return "기타/확인필요"
-
-
-def make_shipment_summary(raw_orders):
-    """업로드한 엑셀 원본행 기준 오늘 출고 총합 계산"""
-    if raw_orders is None or raw_orders.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    rows = []
-    for _, r in raw_orders.iterrows():
-        product = str(r.get("product_name", ""))
-        qty = int(r.get("quantity", 1) or 1)
-        pack = detect_pack_count(product)
-        item = classify_product(product)
-        actual = qty * pack
-        rows.append({
-            "원본상품명": product,
-            "자동분류": item,
-            "개입수": pack,
-            "주문수량": qty,
-            "실제출고수량": actual,
-            "채널": r.get("channel", ""),
-        })
-
-    detail = pd.DataFrame(rows)
-    if detail.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    summary = (
-        detail.groupby("자동분류", as_index=False)
-        .agg(
-            실제출고수량=("실제출고수량", "sum"),
-            주문수량합=("주문수량", "sum"),
-            상품행수=("원본상품명", "count"),
-        )
-        .sort_values("실제출고수량", ascending=False)
-    )
-    return summary, detail
-
-
-def fetch_all_limited(table_name, order_col=None, limit=500, desc=True):
-    if sb is None:
-        return pd.DataFrame()
-    q = sb.table(table_name).select("*")
-    if order_col:
-        q = q.order(order_col, desc=desc)
-    res = q.limit(limit).execute()
-    return pd.DataFrame(res.data or [])
-
-
 def make_ai_context(customer_df, orders_db):
     """AI에게 넘길 CRM 요약. 개인정보 보호를 위해 이름/전화번호/주소는 전송하지 않음."""
     if customer_df is None or customer_df.empty:
@@ -945,6 +848,78 @@ def ask_ai_crm(question, customer_df, orders_db):
         data = res.json()
         return data["choices"][0]["message"]["content"]
 
+
+
+def infer_item_unit(product_name):
+    """상품명에서 품목/개입수를 추정해 실제 출고수량 계산"""
+    name = str(product_name)
+
+    # 개입수 추정: 2개, 2개입, 2병, 2팩, 2입 등
+    unit_count = 1
+    m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', name)
+    if m:
+        try:
+            unit_count = int(m.group(1))
+        except Exception:
+            unit_count = 1
+
+    # 용량
+    if "500" in name or "500ml" in name.lower() or "500ML" in name:
+        size = "500ml"
+    elif "1L" in name.upper() or "1리터" in name or "1ℓ" in name:
+        size = "1L"
+    else:
+        size = "기타"
+
+    # 종류
+    if "단호박" in name or "호박" in name:
+        kind = "단호박식혜"
+    else:
+        kind = "식혜"
+
+    item = f"{kind} {size}" if size != "기타" else f"{kind} 기타"
+    return item, unit_count
+
+
+def make_shipping_summary(order_level):
+    """업로드한 주문 기준 출고 총합 계산"""
+    if order_level is None or order_level.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, r in order_level.iterrows():
+        products = str(r.get("product_names", ""))
+        qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
+
+        # 여러 상품명이 콤마로 묶인 경우 일단 전체 문자열 기준으로 추정
+        item, unit_count = infer_item_unit(products)
+        actual_qty = qty * unit_count
+
+        rows.append({
+            "품목": item,
+            "상품명": products,
+            "주문수량": qty,
+            "개입수": unit_count,
+            "실제출고수량": actual_qty,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    summary = (
+        df.groupby("품목", dropna=False)
+        .agg(
+            실제출고수량=("실제출고수량", "sum"),
+            주문수량=("주문수량", "sum"),
+            상품종류수=("상품명", "nunique"),
+        )
+        .reset_index()
+        .sort_values("실제출고수량", ascending=False)
+    )
+    return summary
+
+
 # =========================
 # 앱 시작
 # =========================
@@ -979,10 +954,6 @@ if "today_customer_analysis" not in st.session_state:
     st.session_state["today_customer_analysis"] = pd.DataFrame()
 if "today_detail_analysis" not in st.session_state:
     st.session_state["today_detail_analysis"] = pd.DataFrame()
-if "today_shipment_summary" not in st.session_state:
-    st.session_state["today_shipment_summary"] = pd.DataFrame()
-if "today_shipment_detail" not in st.session_state:
-    st.session_state["today_shipment_detail"] = pd.DataFrame()
 
 with tab_upload:
     st.markdown("""
@@ -1048,9 +1019,6 @@ with tab_upload:
 
         if frames:
             raw_orders = pd.concat(frames, ignore_index=True)
-            shipment_summary, shipment_detail = make_shipment_summary(raw_orders)
-            st.session_state["today_shipment_summary"] = shipment_summary
-            st.session_state["today_shipment_detail"] = shipment_detail
             order_preview = make_order_level(raw_orders, use_strict=False)
 
             # 기존 DB와 비교한 오늘 주문 분석을 세션에 저장
@@ -1072,15 +1040,9 @@ with tab_upload:
             c4.metric("오늘 재구매", f"{int((today_customer_analysis['기존주문횟수'] >= 1).sum()) if not today_customer_analysis.empty else 0:,}명")
             c5.metric("주의/블랙", f"{int((today_customer_analysis['블랙상태'].isin(['주의','블랙'])).sum()) if not today_customer_analysis.empty else 0:,}명")
 
-            st.success("분석 완료. 위쪽의 `🔥 오늘 주문 분석` 탭에서 출고 총합과 재구매/VIP/블랙 고객을 확인하세요.")
+            st.success("분석 완료. 위쪽의 `🔥 오늘 주문 분석` 탭에서 재구매/VIP/블랙 고객을 색상으로 확인하세요.")
 
-            with st.expander("📦 오늘 출고 총합 바로 보기", expanded=True):
-                if not shipment_summary.empty:
-                    st.dataframe(shipment_summary, use_container_width=True, hide_index=True)
-                else:
-                    st.info("출고 총합 데이터가 없습니다.")
-
-            with st.expander("오늘 주문 고객 요약 바로 보기", expanded=False):
+            with st.expander("오늘 주문 고객 요약 바로 보기", expanded=True):
                 if not today_customer_analysis.empty:
                     st.dataframe(style_today_customer_table(today_customer_analysis), use_container_width=True, hide_index=True)
                 else:
@@ -1100,8 +1062,6 @@ with tab_upload:
                     st.session_state["today_order_preview"] = pd.DataFrame()
                     st.session_state["today_customer_analysis"] = pd.DataFrame()
                     st.session_state["today_detail_analysis"] = pd.DataFrame()
-                    st.session_state["today_shipment_summary"] = pd.DataFrame()
-                    st.session_state["today_shipment_detail"] = pd.DataFrame()
                     st.rerun()
 
 # DB 데이터 로드
@@ -1157,16 +1117,6 @@ with tab_today:
         d.metric("VIP 재주문", f"{vip_reorder_count:,}명")
         e.metric("주의/블랙", f"{black_today_count:,}명")
 
-        st.subheader("📦 오늘 출고 총합")
-        shipment_summary = st.session_state.get("today_shipment_summary", pd.DataFrame())
-        shipment_detail = st.session_state.get("today_shipment_detail", pd.DataFrame())
-        if shipment_summary is not None and not shipment_summary.empty:
-            st.dataframe(shipment_summary, use_container_width=True, hide_index=True)
-            with st.expander("출고 계산 상세 보기", expanded=False):
-                st.dataframe(shipment_detail, use_container_width=True, hide_index=True, height=360)
-        else:
-            st.info("엑셀 업로드 후 오늘 출고 총합이 표시됩니다.")
-
         st.markdown("""
         - ⚪ 신규: 기존 DB에 없던 고객
         - 🟢 재주문: 기존 주문 이력이 있는 고객
@@ -1174,6 +1124,15 @@ with tab_today:
         - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
         - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
         """)
+
+        st.subheader("📦 오늘 출고 총합")
+        today_order_preview = st.session_state.get("today_order_preview", pd.DataFrame())
+        shipping_summary = make_shipping_summary(today_order_preview)
+        if shipping_summary.empty:
+            st.info("출고 총합 데이터가 없습니다.")
+        else:
+            st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
+
 
         filter_status = st.multiselect(
             "상태 필터",
@@ -1281,14 +1240,8 @@ with tab_customers:
     ]
     show_cols = [c for c in show_cols if c in view.columns]
 
-    total_view_count = len(view)
-    if not search and total_view_count > 500:
-        st.caption(f"표시 속도를 위해 상위 500명만 표시합니다. 전체 {total_view_count:,}명 중 필요한 고객은 검색창으로 찾으세요.")
-        display_view = view.head(500)
-    else:
-        display_view = view
-
-    st.dataframe(style_customer_crm_table(display_view[show_cols]), use_container_width=True, hide_index=True, height=520)
+    st.dataframe(style_customer_crm_table(view[show_cols].head(500)), use_container_width=True, hide_index=True, height=520)
+    st.caption("속도 개선을 위해 화면에는 최대 500명만 표시합니다. 검색어를 입력하면 원하는 고객을 빠르게 찾을 수 있습니다.")
 
     st.info("상세 주문내역은 `🔎 고객 상세` 탭에서 고객을 선택하면 볼 수 있습니다.")
 
@@ -1398,7 +1351,7 @@ with tab_ai:
     ```toml
     AI_PROVIDER = "gemini"
     GEMINI_API_KEY = "..."
-    GEMINI_MODEL = "gemini-1.5-flash"
+    GEMINI_MODEL = "gemini-2.0-flash"
     ```
     """)
 
@@ -1484,14 +1437,8 @@ with tab_black:
 
 with tab_orders:
     st.subheader("저장된 주문 DB")
-    show_all_orders = st.checkbox("전체 주문 보기", value=False)
-    sorted_orders = orders_db.sort_values("order_date", ascending=False)
-    if show_all_orders:
-        st.caption(f"전체 {len(sorted_orders):,}건 표시")
-        st.dataframe(sorted_orders, use_container_width=True, hide_index=True, height=560)
-    else:
-        st.caption(f"최근 500건만 표시 중 / 전체 {len(sorted_orders):,}건")
-        st.dataframe(sorted_orders.head(500), use_container_width=True, hide_index=True, height=560)
+    st.dataframe(orders_db.sort_values("order_date", ascending=False).head(500), use_container_width=True, hide_index=True)
+    st.caption("속도 개선을 위해 최근 500건만 표시합니다. 전체 데이터는 다운로드 탭에서 받을 수 있습니다.")
 
 with tab_download:
     st.subheader("엑셀 다운로드")
@@ -1522,21 +1469,12 @@ with tab_download:
         download_sheets["오늘주문분석"] = today_customer_analysis
     if today_detail_analysis is not None and not today_detail_analysis.empty:
         download_sheets["오늘주문상세"] = today_detail_analysis
-    today_shipment_summary = st.session_state.get("today_shipment_summary", pd.DataFrame())
-    today_shipment_detail = st.session_state.get("today_shipment_detail", pd.DataFrame())
-    if today_shipment_summary is not None and not today_shipment_summary.empty:
-        download_sheets["오늘출고총합"] = today_shipment_summary
-    if today_shipment_detail is not None and not today_shipment_detail.empty:
-        download_sheets["오늘출고상세"] = today_shipment_detail
 
-    if st.button("다운로드 파일 생성", type="primary"):
-        with st.spinner("엑셀 파일 생성 중..."):
-            st.session_state["download_excel_bytes"] = to_excel_bytes(download_sheets)
+    excel_bytes = to_excel_bytes(download_sheets)
 
-    if "download_excel_bytes" in st.session_state:
-        st.download_button(
-            "저장형 CRM 엑셀 다운로드",
-            data=st.session_state["download_excel_bytes"],
-            file_name=f"sikhye_saved_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.download_button(
+        "저장형 CRM 엑셀 다운로드",
+        data=excel_bytes,
+        file_name=f"sikhye_saved_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
