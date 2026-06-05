@@ -83,15 +83,6 @@ st.markdown("""
     font-size: 13px;
 }
 
-
-/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
-[data-testid="stFileUploaderDropzone"] {
-    min-height: 130px !important;
-    border: 2px dashed #94a3b8 !important;
-    border-radius: 18px !important;
-    background: #f8fafc !important;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -286,7 +277,8 @@ def standardize(df, market, filename):
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
     product_base = safe_series(df, product_col, "").map(normalize_text)
     option_text = safe_series(df, option_col, "").map(normalize_text)
-    out["product_name"] = (product_base + " " + option_text).str.strip()
+    # 네이버는 상품명에 단호박이 섞여 있어 일반 1L도 단호박으로 오분류될 수 있으므로 옵션정보를 우선 사용
+    out["product_name"] = option_text.where(option_text.str.strip() != "", product_base)
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
@@ -863,39 +855,34 @@ def ask_ai_crm(question, customer_df, orders_db):
 
 
 def infer_shipping_item(product_name):
-    """상품명/옵션정보에서 품목/개입수를 추정"""
-    full_name = str(product_name)
-    name = full_name
+    """옵션정보 기준으로 품목/개입수 추정"""
+    text = str(product_name).strip()
 
-    # 네이버 옵션정보의 '용량:' 부분 우선 사용
-    m_opt = re.search(r'용량\s*:\s*([^,\n\r]+)', full_name)
+    # '용량:' 뒤만 사용
+    m_opt = re.search(r'용량\s*:\s*(.*)', text)
     if m_opt:
-        name = m_opt.group(1).strip()
+        text = m_opt.group(1).strip()
 
-    upper = name.upper()
+    upper = text.upper()
 
     unit_count = 1
-    m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', name)
+    m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', text)
     if m:
         try:
             unit_count = int(m.group(1))
         except Exception:
             unit_count = 1
 
-    if "200" in name or "200ML" in upper:
+    if "200" in text or "200ML" in upper:
         size = "200ml"
-    elif "500" in name or "500ML" in upper:
+    elif "500" in text or "500ML" in upper:
         size = "500ml"
-    elif "1L" in upper or "1리터" in name or "1ℓ" in name:
+    elif "1L" in upper or "1리터" in text or "1ℓ" in text:
         size = "1L"
     else:
         size = "기타"
 
-    if "단호박" in name or "호박" in name:
-        kind = "단호박식혜"
-    else:
-        kind = "식혜"
-
+    kind = "단호박식혜" if ("단호박" in text or "호박" in text) else "식혜"
     return f"{kind} {size}", unit_count
 
 
