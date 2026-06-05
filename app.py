@@ -83,6 +83,22 @@ st.markdown("""
     font-size: 13px;
 }
 
+
+/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
+[data-testid="stFileUploaderDropzone"] {
+    min-height: 130px !important;
+    border: 2px dashed #94a3b8 !important;
+    border-radius: 18px !important;
+    background: #f8fafc !important;
+}
+[data-testid="stFileUploaderDropzone"] div {
+    font-size: 16px !important;
+}
+[data-testid="stFileUploaderDropzone"] button {
+    font-size: 16px !important;
+    padding: 0.6rem 1rem !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -259,6 +275,7 @@ def standardize(df, market, filename):
     buyer_col = pick_col(df, ["구매자명", "구매자", "주문자명"])
     buyer_phone_col = pick_col(df, ["구매자연락처", "구매자전화번호", "주문자연락처"])
     qty_col = pick_col(df, ["수량", "구매수(수량)", "구매수량"])
+    option_col = pick_col(df, ["옵션정보", "옵션명", "옵션값", "옵션내용"])
 
     out = pd.DataFrame(index=df.index)
     out["channel"] = market
@@ -274,7 +291,9 @@ def standardize(df, market, filename):
     out["buyer_name"] = safe_series(df, buyer_col, "").map(normalize_text)
     out["buyer_phone"] = safe_series(df, buyer_phone_col, "").map(normalize_phone)
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
-    out["product_name"] = safe_series(df, product_col, "").map(normalize_text)
+    product_base = safe_series(df, product_col, "").map(normalize_text)
+    option_text = safe_series(df, option_col, "").map(normalize_text)
+    out["product_name"] = (product_base + " " + option_text).str.strip()
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
@@ -865,7 +884,9 @@ def infer_shipping_item(product_name):
 
     # 용량
     upper = name.upper()
-    if "500" in name or "500ML" in upper:
+    if "200" in name or "200ML" in upper:
+        size = "200ml"
+    elif "500" in name or "500ML" in upper:
         size = "500ml"
     elif "1L" in upper or "1리터" in name or "1ℓ" in name:
         size = "1L"
@@ -994,13 +1015,13 @@ if "today_detail_analysis" not in st.session_state:
 with tab_upload:
     st.markdown("""
     <div class="upload-guide">
-        <div class="upload-title">📂 쿠팡/네이버 엑셀을 여기에 끌어다 놓기</div>
-        <div class="upload-sub">파일 여러 개를 한 번에 드래그하거나, 아래 큰 버튼을 눌러 추가 업로드하세요.</div>
+        <div class="upload-title">📂 아래 업로드 박스에 엑셀을 끌어다 놓으세요</div>
+        <div class="upload-sub">화면 아래의 실제 업로드 박스가 드래그앤드롭 영역입니다.</div>
     </div>
     """, unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "➕ 엑셀 파일 추가 업로드",
+        "📂 쿠팡/네이버 엑셀을 여기에 끌어다 놓기",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
         help="쿠팡 DeliveryList, 네이버 스마트스토어 엑셀을 여러 개 동시에 올릴 수 있습니다.",
