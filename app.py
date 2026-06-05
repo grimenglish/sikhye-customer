@@ -1161,6 +1161,23 @@ with tab_today:
         - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
         """)
 
+        st.subheader("📦 오늘 출고 총합")
+        today_order_preview = st.session_state.get("today_order_preview", pd.DataFrame())
+        shipping_summary = make_shipping_summary(today_order_preview)
+
+        if shipping_summary.empty:
+            st.info("오늘 업로드된 주문이 없습니다.")
+        else:
+            st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
+
+        with st.expander("최근 주간 평균 출고량", expanded=False):
+            avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
+            weekly_avg = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
+            if weekly_avg.empty:
+                st.info("주간 평균 출고량 데이터가 없습니다.")
+            else:
+                st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
+
         filter_status = st.multiselect(
             "상태 필터",
             options=sorted(today_customer_analysis["오늘고객상태"].unique()),
@@ -1495,7 +1512,8 @@ with tab_black:
 
 with tab_orders:
     st.subheader("저장된 주문 DB")
-    st.dataframe(orders_db.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
+    st.dataframe(orders_db.sort_values("order_date", ascending=False).head(500), use_container_width=True, hide_index=True)
+    st.caption("속도 개선을 위해 최근 500건만 표시합니다. 전체 데이터는 다운로드 탭에서 받을 수 있습니다.")
 
 with tab_download:
     st.subheader("엑셀 다운로드")
