@@ -83,22 +83,6 @@ st.markdown("""
     font-size: 13px;
 }
 
-
-/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
-[data-testid="stFileUploaderDropzone"] {
-    min-height: 130px !important;
-    border: 2px dashed #94a3b8 !important;
-    border-radius: 18px !important;
-    background: #f8fafc !important;
-}
-[data-testid="stFileUploaderDropzone"] div {
-    font-size: 16px !important;
-}
-[data-testid="stFileUploaderDropzone"] button {
-    font-size: 16px !important;
-    padding: 0.6rem 1rem !important;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -275,7 +259,6 @@ def standardize(df, market, filename):
     buyer_col = pick_col(df, ["구매자명", "구매자", "주문자명"])
     buyer_phone_col = pick_col(df, ["구매자연락처", "구매자전화번호", "주문자연락처"])
     qty_col = pick_col(df, ["수량", "구매수(수량)", "구매수량"])
-    option_col = pick_col(df, ["옵션정보", "옵션명", "옵션값", "옵션내용"])
 
     out = pd.DataFrame(index=df.index)
     out["channel"] = market
@@ -291,9 +274,7 @@ def standardize(df, market, filename):
     out["buyer_name"] = safe_series(df, buyer_col, "").map(normalize_text)
     out["buyer_phone"] = safe_series(df, buyer_phone_col, "").map(normalize_phone)
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
-    product_base = safe_series(df, product_col, "").map(normalize_text)
-    option_text = safe_series(df, option_col, "").map(normalize_text)
-    out["product_name"] = (product_base + " " + option_text).str.strip()
+    out["product_name"] = safe_series(df, product_col, "").map(normalize_text)
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
@@ -870,10 +851,17 @@ def ask_ai_crm(question, customer_df, orders_db):
 
 
 def infer_shipping_item(product_name):
-    """상품명에서 품목/개입수를 추정"""
-    name = str(product_name)
+    """상품명/옵션정보에서 품목/개입수를 추정"""
+    full_name = str(product_name)
+    name = full_name
 
-    # 개입수: 2개, 2개입, 2병, 2팩 등
+    # 네이버 옵션정보의 '용량:' 부분 우선 사용
+    m_opt = re.search(r'용량\s*:\s*([^,\n\r]+)', full_name)
+    if m_opt:
+        name = m_opt.group(1).strip()
+
+    upper = name.upper()
+
     unit_count = 1
     m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', name)
     if m:
@@ -882,8 +870,6 @@ def infer_shipping_item(product_name):
         except Exception:
             unit_count = 1
 
-    # 용량
-    upper = name.upper()
     if "200" in name or "200ML" in upper:
         size = "200ml"
     elif "500" in name or "500ML" in upper:
@@ -893,7 +879,6 @@ def infer_shipping_item(product_name):
     else:
         size = "기타"
 
-    # 종류
     if "단호박" in name or "호박" in name:
         kind = "단호박식혜"
     else:
@@ -1015,13 +1000,13 @@ if "today_detail_analysis" not in st.session_state:
 with tab_upload:
     st.markdown("""
     <div class="upload-guide">
-        <div class="upload-title">📂 아래 업로드 박스에 엑셀을 끌어다 놓으세요</div>
-        <div class="upload-sub">화면 아래의 실제 업로드 박스가 드래그앤드롭 영역입니다.</div>
+        <div class="upload-title">📂 쿠팡/네이버 엑셀을 여기에 끌어다 놓기</div>
+        <div class="upload-sub">파일 여러 개를 한 번에 드래그하거나, 아래 큰 버튼을 눌러 추가 업로드하세요.</div>
     </div>
     """, unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "📂 쿠팡/네이버 엑셀을 여기에 끌어다 놓기",
+        "➕ 엑셀 파일 추가 업로드",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
         help="쿠팡 DeliveryList, 네이버 스마트스토어 엑셀을 여러 개 동시에 올릴 수 있습니다.",
@@ -1181,23 +1166,6 @@ with tab_today:
         - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
         - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
         """)
-
-        st.subheader("📦 오늘 출고 총합")
-        today_order_preview = st.session_state.get("today_order_preview", pd.DataFrame())
-        shipping_summary = make_shipping_summary(today_order_preview)
-
-        if shipping_summary.empty:
-            st.info("오늘 업로드된 주문이 없습니다.")
-        else:
-            st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
-
-        with st.expander("최근 주간 평균 출고량", expanded=False):
-            avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
-            weekly_avg = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
-            if weekly_avg.empty:
-                st.info("주간 평균 출고량 데이터가 없습니다.")
-            else:
-                st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
 
         filter_status = st.multiselect(
             "상태 필터",
@@ -1533,8 +1501,7 @@ with tab_black:
 
 with tab_orders:
     st.subheader("저장된 주문 DB")
-    st.dataframe(orders_db.sort_values("order_date", ascending=False).head(500), use_container_width=True, hide_index=True)
-    st.caption("속도 개선을 위해 최근 500건만 표시합니다. 전체 데이터는 다운로드 탭에서 받을 수 있습니다.")
+    st.dataframe(orders_db.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
 
 with tab_download:
     st.subheader("엑셀 다운로드")
