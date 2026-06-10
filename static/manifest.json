@@ -1,1 +1,18 @@
-
+{
+  "name": "식혜명가 CRM",
+  "short_name": "식혜CRM",
+  "description": "식혜명가 고객 재구매 CRM",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ff4b4b",
+  "icons": [
+    {
+      "src": "/app/static/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
