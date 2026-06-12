@@ -19,21 +19,10 @@ except Exception:
 
 
 st.set_page_config(
-    page_title="식혜명가 CRM",
-    page_icon="🥤",
+    page_title="식혜명가 저장형 고객 CRM",
+    page_icon="📦",
     layout="wide",
 )
-
-
-st.markdown("""
-<link rel="manifest" href="/app/static/manifest.json">
-<link rel="apple-touch-icon" href="/app/static/icon-192.png">
-<meta name="theme-color" content="#ff4b4b">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="식혜명가 CRM">
-<meta name="application-name" content="식혜명가 CRM">
-""", unsafe_allow_html=True)
 
 st.markdown("""
 <style>
@@ -92,6 +81,15 @@ st.markdown("""
 }
 [data-testid="stDataFrame"] div {
     font-size: 13px;
+}
+
+
+/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
+[data-testid="stFileUploaderDropzone"] {
+    min-height: 130px !important;
+    border: 2px dashed #94a3b8 !important;
+    border-radius: 18px !important;
+    background: #f8fafc !important;
 }
 
 </style>
@@ -270,6 +268,7 @@ def standardize(df, market, filename):
     buyer_col = pick_col(df, ["구매자명", "구매자", "주문자명"])
     buyer_phone_col = pick_col(df, ["구매자연락처", "구매자전화번호", "주문자연락처"])
     qty_col = pick_col(df, ["수량", "구매수(수량)", "구매수량"])
+    option_col = pick_col(df, ["옵션정보", "옵션명", "옵션값", "옵션내용"])
 
     out = pd.DataFrame(index=df.index)
     out["channel"] = market
@@ -285,7 +284,12 @@ def standardize(df, market, filename):
     out["buyer_name"] = safe_series(df, buyer_col, "").map(normalize_text)
     out["buyer_phone"] = safe_series(df, buyer_phone_col, "").map(normalize_phone)
     out["address"] = safe_series(df, address_col, "").map(normalize_address)
-    out["product_name"] = safe_series(df, product_col, "").map(normalize_text)
+    product_base = safe_series(df, product_col, "").map(normalize_text)
+    option_text = safe_series(df, option_col, "").map(normalize_text)
+    if market == "네이버":
+        out["product_name"] = option_text.where(option_text.str.strip() != "", product_base)
+    else:
+        out["product_name"] = (product_base + " " + option_text).str.strip()
     out["quantity"] = pd.to_numeric(safe_series(df, qty_col, 1), errors="coerce").fillna(1).astype(int)
     out["amount"] = pd.to_numeric(safe_series(df, amount_col, 0), errors="coerce").fillna(0).astype(int)
 
@@ -861,62 +865,74 @@ def ask_ai_crm(question, customer_df, orders_db):
 
 
 
-def infer_shipping_item(product_name):
-    """상품명에서 품목/개입수를 추정"""
-    name = str(product_name)
 
-    # 개입수: 2개, 2개입, 2병, 2팩 등
+def infer_shipping_item(product_name, channel=""):
+    text = str(product_name).strip()
+    channel = str(channel)
+
+    if channel == "네이버":
+        m_opt = re.search(r'용량\s*:\s*(.*)', text)
+        if m_opt:
+            text = m_opt.group(1).strip()
+
     unit_count = 1
-    m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', name)
+    m = re.search(r'(\d+)\s*(개입|개|병|팩|입)', text)
     if m:
         try:
             unit_count = int(m.group(1))
         except Exception:
             unit_count = 1
 
-    # 용량
-    upper = name.upper()
-    if "500" in name or "500ML" in upper:
+    if channel == "쿠팡":
+        m2 = re.search(r'(?:1\s*L|1리터|1000\s*ml|1000\s*ML).*?(\d+)\s*(개|병|팩)', text, flags=re.I)
+        if m2:
+            unit_count = int(m2.group(1))
+        m3 = re.search(r'(\d+)\s*(개|병|팩).*?(?:1\s*L|1리터|1000\s*ml|1000\s*ML)', text, flags=re.I)
+        if m3:
+            unit_count = int(m3.group(1))
+
+    if re.search(r'200\s*ML|200\s*ml|200미리|200', text):
+        size = "200ml"
+    elif re.search(r'500\s*ML|500\s*ml|500미리|500', text):
         size = "500ml"
-    elif "1L" in upper or "1리터" in name or "1ℓ" in name:
+    elif re.search(r'1\s*L|1리터|1ℓ|1000\s*ML|1000\s*ml', text, flags=re.I):
         size = "1L"
     else:
         size = "기타"
 
-    # 종류
-    if "단호박" in name or "호박" in name:
-        kind = "단호박식혜"
-    else:
-        kind = "식혜"
-
+    kind = "단호박식혜" if ("단호박" in text or "호박" in text) else "식혜"
     return f"{kind} {size}", unit_count
 
 
-def make_shipping_summary(order_level):
-    """업로드 주문 기준 오늘 출고 총합"""
-    if order_level is None or order_level.empty:
-        return pd.DataFrame(columns=["품목", "실제출고수량", "주문수량", "상품종류수"])
+def make_shipping_line_items(raw_orders):
+    if raw_orders is None or raw_orders.empty:
+        return pd.DataFrame(columns=["품목", "채널", "상품명", "주문수량", "개입수", "실제출고수량", "주문일"])
 
     rows = []
-    for _, r in order_level.iterrows():
-        product = str(r.get("product_names", ""))
-        qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
-        item, unit_count = infer_shipping_item(product)
-
+    for _, r in raw_orders.iterrows():
+        product = str(r.get("product_name", ""))
+        channel = str(r.get("channel", ""))
+        qty = int(r.get("quantity", 0)) if pd.notna(r.get("quantity", 0)) else 0
+        item, unit_count = infer_shipping_item(product, channel)
         rows.append({
             "품목": item,
+            "채널": channel,
             "상품명": product,
             "주문수량": qty,
             "개입수": unit_count,
             "실제출고수량": qty * unit_count,
+            "주문일": pd.to_datetime(r.get("order_date", pd.NaT), errors="coerce"),
         })
+    return pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows)
-    if df.empty:
+
+def make_shipping_summary(raw_orders):
+    line = make_shipping_line_items(raw_orders)
+    if line.empty:
         return pd.DataFrame(columns=["품목", "실제출고수량", "주문수량", "상품종류수"])
 
     return (
-        df.groupby("품목", dropna=False)
+        line.groupby("품목", dropna=False)
         .agg(
             실제출고수량=("실제출고수량", "sum"),
             주문수량=("주문수량", "sum"),
@@ -927,15 +943,31 @@ def make_shipping_summary(order_level):
     )
 
 
+def make_weekly_shipping_table_from_orders(raw_orders):
+    line = make_shipping_line_items(raw_orders)
+    if line.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    line = line.dropna(subset=["주문일"]).copy()
+    if line.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    line["주"] = line["주문일"].dt.to_period("W").astype(str)
+
+    weekly = line.groupby(["주", "품목"], dropna=False)["실제출고수량"].sum().reset_index()
+    pivot = weekly.pivot(index="주", columns="품목", values="실제출고수량").fillna(0).astype(int).reset_index()
+    avg = weekly.groupby("품목")["실제출고수량"].mean().round(1).reset_index(name="주별평균출고수량")
+    avg = avg.sort_values("주별평균출고수량", ascending=False)
+    return pivot, avg
+
+
 def make_weekly_shipping_average(orders_db, weeks=8):
-    """최근 N주 기준 품목별 주간 평균 출고량"""
     if orders_db is None or orders_db.empty:
         return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
 
     df = orders_db.copy()
     df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
     df = df.dropna(subset=["order_date"])
-
     if df.empty:
         return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
 
@@ -946,22 +978,16 @@ def make_weekly_shipping_average(orders_db, weeks=8):
     rows = []
     for _, r in df.iterrows():
         product = str(r.get("product_names", ""))
+        channel = str(r.get("channel", ""))
         qty = int(r.get("total_quantity", 0)) if pd.notna(r.get("total_quantity", 0)) else 0
-        item, unit_count = infer_shipping_item(product)
-        rows.append({
-            "품목": item,
-            "실제출고수량": qty * unit_count,
-        })
+        item, unit_count = infer_shipping_item(product, channel)
+        rows.append({"품목": item, "실제출고수량": qty * unit_count})
 
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"])
 
-    summary = (
-        out.groupby("품목", dropna=False)
-        .agg(최근총출고수량=("실제출고수량", "sum"))
-        .reset_index()
-    )
+    summary = out.groupby("품목", dropna=False).agg(최근총출고수량=("실제출고수량", "sum")).reset_index()
     summary["분석주수"] = weeks
     summary["최근주간평균출고수량"] = (summary["최근총출고수량"] / weeks).round(1)
     return summary[["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"]].sort_values("최근주간평균출고수량", ascending=False)
@@ -997,6 +1023,8 @@ tab_upload, tab_today, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai
 
 if "today_order_preview" not in st.session_state:
     st.session_state["today_order_preview"] = pd.DataFrame()
+if "today_raw_orders" not in st.session_state:
+    st.session_state["today_raw_orders"] = pd.DataFrame()
 if "today_customer_analysis" not in st.session_state:
     st.session_state["today_customer_analysis"] = pd.DataFrame()
 if "today_detail_analysis" not in st.session_state:
@@ -1075,6 +1103,7 @@ with tab_upload:
             today_customer_analysis, today_detail_analysis = analyze_today_orders(
                 order_preview, orders_db_current, customer_df_current, black_df_current
             )
+            st.session_state["today_raw_orders"] = raw_orders
             st.session_state["today_order_preview"] = order_preview
             st.session_state["today_customer_analysis"] = today_customer_analysis
             st.session_state["today_detail_analysis"] = today_detail_analysis
@@ -1106,6 +1135,7 @@ with tab_upload:
                     st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
             with col_clear:
                 if st.button("화면 분석 결과 초기화", use_container_width=True):
+                    st.session_state["today_raw_orders"] = pd.DataFrame()
                     st.session_state["today_order_preview"] = pd.DataFrame()
                     st.session_state["today_customer_analysis"] = pd.DataFrame()
                     st.session_state["today_detail_analysis"] = pd.DataFrame()
@@ -1171,6 +1201,38 @@ with tab_today:
         - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
         - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
         """)
+
+        st.subheader("📦 오늘 출고 총합")
+        today_raw_orders = st.session_state.get("today_raw_orders", pd.DataFrame())
+        shipping_summary = make_shipping_summary(today_raw_orders)
+
+        if shipping_summary.empty:
+            st.info("오늘 업로드된 주문이 없습니다.")
+        else:
+            st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
+
+        with st.expander("주별 출고량 / 품목별 주간 평균", expanded=False):
+            weekly_table, weekly_avg = make_weekly_shipping_table_from_orders(today_raw_orders)
+
+            st.markdown("**업로드 파일 기준 주별 출고량**")
+            if weekly_table.empty:
+                st.info("주별 출고량 데이터가 없습니다.")
+            else:
+                st.dataframe(weekly_table, use_container_width=True, hide_index=True)
+
+            st.markdown("**품목별 주간 평균 출고량**")
+            if weekly_avg.empty:
+                st.info("품목별 주간 평균 데이터가 없습니다.")
+            else:
+                st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
+
+        with st.expander("저장 DB 기준 최근 N주 평균 출고량", expanded=False):
+            avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
+            weekly_avg_db = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
+            if weekly_avg_db.empty:
+                st.info("주간 평균 출고량 데이터가 없습니다.")
+            else:
+                st.dataframe(weekly_avg_db, use_container_width=True, hide_index=True)
 
         filter_status = st.multiselect(
             "상태 필터",
