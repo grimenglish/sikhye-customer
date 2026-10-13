@@ -1346,6 +1346,118 @@ def render_historical_production_report(orders_db, as_of, infer_fn):
         st.caption("📋 작년 요일별 주문 건수: " + day_orders)
 
 
+def _recorded_inventory_calendar(rows):
+    """확정 저장된 실출고 스냅샷만 날짜별로 묶는다. 미기록일은 0과 구분한다."""
+    calendar = {}
+    for row in rows:
+        try:
+            day = date.fromisoformat(str(row.get("inventory_date", ""))[:10])
+            key = row.get("item_key")
+            if key not in KEYS:
+                continue
+            calendar.setdefault(day, {})[key] = _safe_int(row.get("actual_ship_qty"))
+        except (ValueError, TypeError):
+            pass
+    return calendar
+
+
+def _week_snapshot(calendar, monday):
+    """품목별 월~금 실출고 및 기록 현황. 미기록일은 None; 0은 실제 0개."""
+    days = [monday + timedelta(days=i) for i in range(5)]
+    complete_days = [d for d in days if all(k in calendar.get(d, {}) for k in KEYS)]
+    result = {}
+    for key in KEYS:
+        quantities = [calendar.get(d, {}).get(key) for d in days]
+        result[key] = {
+            "daily": quantities,
+            "recorded": sum(q is not None for q in quantities),
+            "partial": sum(q for q in quantities if q is not None),
+            "total": sum(quantities) if all(q is not None for q in quantities) else None,
+        }
+    return {"days": days, "complete_days": len(complete_days), "items": result}
+
+
+def _prior_year_monday(as_of):
+    iso = as_of.isocalendar()
+    try:
+        return date.fromisocalendar(iso.year - 1, iso.week, 1)
+    except ValueError:
+        # ISO 53주가 전년에 없다면 52주를 참조한다.
+        return date.fromisocalendar(iso.year - 1, 52, 1)
+
+
+def _completed_week_average(calendar, anchor_monday, count=4):
+    """기준 주 이전 count주만 비교. 5일 모두 기록된 주만 평균에 포함."""
+    completed = []
+    for i in range(count, 0, -1):
+        monday = anchor_monday - timedelta(weeks=i)
+        week = _week_snapshot(calendar, monday)
+        if week["complete_days"] == 5:
+            completed.append(week)
+    if not completed:
+        return {k: None for k in KEYS}, 0
+    return {
+        k: sum(w["items"][k]["total"] for w in completed) / len(completed)
+        for k in KEYS
+    }, len(completed)
+
+
+def render_verified_inventory_history(history_rows, as_of):
+    """내년에는 작년 같은 ISO주 실제 월~금 기록으로 바뀌는 비교 영역."""
+    calendar = _recorded_inventory_calendar(history_rows)
+    recorded_days = sorted(d for d, values in calendar.items() if all(k in values for k in KEYS))
+    this_monday = as_of - timedelta(days=as_of.weekday())
+    last_monday = _prior_year_monday(as_of)
+    current = _week_snapshot(calendar, this_monday)
+    prior = _week_snapshot(calendar, last_monday)
+    prev_avg, prev_count = _completed_week_average(calendar, this_monday, count=4)
+    last_avg, last_count = _completed_week_average(calendar, last_monday, count=4)
+
+    st.markdown("### 📆 실제 출고 기록 · 주간 생산 참고")
+    st.caption("주문 DB 추정치가 아니라, **재고관리에서 최종 저장한 '오늘 출고'** 수량만 사용합니다. 월~금 기준입니다.")
+    cols = st.columns(3)
+    cols[0].metric("출고 기록한 날짜", f"{len(recorded_days):,}일")
+    cols[1].metric("이번 주 기록", f"{current['complete_days']}/5일")
+    cols[2].metric("최근 4주 월~금 평균", f"{prev_count}/4주 확보")
+    if recorded_days:
+        st.caption(f"기록 시작 **{recorded_days[0]:%Y.%m.%d}** · 마지막 저장 **{recorded_days[-1]:%Y.%m.%d}** · 미기록일은 출고 0개로 처리하지 않습니다.")
+    else:
+        st.info("아직 확정된 출고 기록이 없습니다. 위에서 매일 수량을 확인한 뒤 **'오늘 재고 최종 저장'**을 누르면 오늘부터 기록이 쌓입니다. 출고가 0개인 날도 저장해야 정확한 주간 평균을 계산할 수 있습니다.")
+
+    st.markdown(f"**이번 주 | {this_monday:%Y.%m.%d}(월) ~ {(this_monday + timedelta(days=4)):%m.%d}(금)**")
+    cols = [f"{wk} {day:%m/%d}" for wk, day in zip(["월","화","수","목","금"], current["days"])]
+    table_rows = []
+    for key, name, _, _ in ITEMS:
+        info = current["items"][key]
+        row = {"품목": name}
+        row.update({c: (f"{v:,}" if v is not None else "—") for c, v in zip(cols, info["daily"])})
+        row["기록된 합계"] = f"{info['partial']:,}" if info["recorded"] else "—"
+        row["이전 4주 평균"] = f"{prev_avg[key]:,.1f}" if prev_avg[key] is not None else "—"
+        table_rows.append(row)
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+    st.caption("'기록된 합계'는 저장된 날짜만 합산합니다. **— = 미기록**, **0 = 0개 출고를 확인하고 저장**한 날입니다. 4주 평균은 월~금 모두 기록된 주만 계산합니다.")
+
+    st.markdown(f"**작년 같은 주 | {last_monday:%Y.%m.%d}(월) ~ {(last_monday + timedelta(days=4)):%m.%d}(금)**")
+    if prior["complete_days"] == 0:
+        st.info("작년 같은 주의 **확정된 실제 출고 기록이 아직 없습니다.** 과거 주문 DB의 부분 집계는 생산량으로 오인하기 쉬워 여기에는 표시하지 않습니다. 오늘부터 저장하면 내년 같은 주 비교에 자동으로 표시돼요.")
+    else:
+        st.caption(f"작년 기록 {prior['complete_days']}/5일 · 작년 직전 4주 중 완전 기록 {last_count}/4주")
+        prior_cols = [f"{wk} {day:%m/%d}" for wk, day in zip(["월","화","수","목","금"], prior["days"])]
+        history_table = []
+        for key, name, _, _ in ITEMS:
+            info = prior["items"][key]
+            row = {"품목": name}
+            row.update({c: (f"{v:,}" if v is not None else "—") for c, v in zip(prior_cols, info["daily"])})
+            row["월~금 합계"] = f"{info['total']:,}" if info["total"] is not None else "—"
+            row["하루 평균"] = f"{info['total']/5:,.1f}" if info["total"] is not None else "—"
+            row["작년 직전 4주 평균"] = f"{last_avg[key]:,.1f}" if last_avg[key] is not None else "—"
+            history_table.append(row)
+        st.dataframe(pd.DataFrame(history_table), use_container_width=True, hide_index=True)
+        if prior["complete_days"] < 5:
+            st.warning("작년 해당 주의 일부 날짜가 빠져 있어 **주간 합계와 일평균은 표시하지 않습니다.** 빠진 날짜를 0개로 간주하면 실제보다 출고량이 작아집니다.")
+    st.caption("같은 ISO 주차의 월~금을 비교하므로 해마다 날짜는 조금씩 다를 수 있습니다. 명절이나 배송 휴무일은 별도로 고려해 생산량을 결정하세요.")
+
+
 def save_inventory(records, summary_note=""):
     client = _get_db_client()
     if client is None:
@@ -1397,7 +1509,7 @@ def _weekly_order_counts(orders_db, as_of):
 def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shipping_item):
     as_of = datetime.now(KST).date()
     st.subheader("📦 재고관리")
-    st.caption(f"{as_of:%Y년 %m월 %d일} 기준  |  수량 확인 → 수정 → 최종 저장  |  생산 후 늘어난 수량은 '기존 재고'에 직접 반영하세요.")
+    st.caption(f"{as_of:%Y년 %m월 %d일} 기준  |  출고와 기존 재고 확인 → 저장  |  저장한 실출고량이 내년 같은 주 생산 참고자료가 됩니다.")
 
     history_rows, error = fetch_inventory_rows()
     today_saved = existing_today(history_rows, as_of)
@@ -1405,6 +1517,10 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
     auto, unknown = today_shipment(raw_orders, shipping_summary_func)
     if error:
         st.warning(error)
+    elif len(today_saved) == len(KEYS):
+        st.success("✅ 오늘 실출고 5개 품목이 DB에 저장되어 있습니다. 수량을 바꾸면 다시 **최종 저장**해 덮어쓸 수 있어요.")
+    else:
+        st.info("📝 오늘 실출고는 아직 미저장 상태입니다. 엑셀과 수동 출고를 확인한 뒤 **최종 저장**을 눌러주세요.")
     if raw_orders is None or raw_orders.empty:
         st.caption("ℹ️ 오늘 업로드한 엑셀이 없어 자동 출고가 0개입니다. 이전 저장값이 있으면 그대로 표시됩니다.")
     if unknown:
@@ -1489,7 +1605,7 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
                  disabled=negative or bool(error)):
         try:
             audit_ok = save_inventory(records, note)
-            st.success("오늘 재고를 저장했습니다. 다시 수정해 저장하면 최신 수량으로 덮어씁니다.")
+            st.success("오늘 5개 품목의 실출고량과 남은 재고를 날짜별로 확정 저장했습니다. 같은 날 재저장하면 최신 값으로 수정됩니다.")
             if not audit_ok:
                 st.warning("최종 재고는 저장됐지만 변경 이력 저장은 실패했습니다.")
             st.rerun()
@@ -1497,7 +1613,7 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
             st.error(f"저장 실패: {type(exc).__name__} - {str(exc)[:150]}")
 
     st.divider()
-    render_historical_production_report(orders_db, as_of, infer_shipping_item)
+    render_verified_inventory_history(history_rows, as_of)
 
     with st.expander("📈 최근 주간 출고 추이 (새 재고 저장 이력)", expanded=False):
         weeks = st.select_slider("조회 기간", options=[4, 8, 12, 26, 52], value=12,
