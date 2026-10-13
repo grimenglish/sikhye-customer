@@ -3,6 +3,8 @@ import io
 import re
 import json
 import math
+import hmac
+import time
 from datetime import datetime, date
 
 from datetime import timedelta
@@ -177,6 +179,16 @@ st.markdown("""
     [data-testid="stFileUploaderDropzoneInstructions"] * { font-size: 15px !important; }
 }
 
+/* V22: 그래프 축/수치 선명도 및 경영 대시보드 간격 */
+[data-testid="stMetric"] [data-testid="stMetricDelta"] { font-size: 15px !important; }
+[data-testid="stMetric"] [data-testid="stMetricLabel"] { line-height: 1.45 !important; }
+[data-testid="stAltairChart"] { min-width: 0; }
+[data-testid="stAltairChart"] canvas { max-width: 100% !important; }
+@media (max-width: 680px) {
+  [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 25px !important; }
+  [data-testid="stMetric"] [data-testid="stMetricLabel"] p { font-size: 14px !important; }
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -188,35 +200,51 @@ SMARTSTORE_PASSWORD = "1111"
 # 앱 비밀번호 로그인
 # =========================
 def require_login():
-    app_password = st.secrets.get("APP_PASSWORD", "")
-
+    """공유 비밀번호 접근 보호. 5회 실패 시 세션별 일시 잠금, 장시간 미사용 시 재로그인."""
+    app_password = str(st.secrets.get("APP_PASSWORD", ""))
     if not app_password:
         st.error("APP_PASSWORD가 Streamlit Secrets에 설정되지 않았습니다. 개인정보 보호를 위해 앱을 열 수 없습니다.")
         st.stop()
 
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if st.session_state["authenticated"]:
+    now = time.monotonic()
+    locked_until = float(st.session_state.get("_login_locked_until", 0.0))
+    last_activity = st.session_state.get("_login_last_activity")
+    if st.session_state.get("authenticated") and last_activity is not None and now - last_activity > 3 * 3600:
+        st.session_state.clear()
+        st.warning("3시간 이상 사용 기록이 없어 로그아웃됐습니다. 다시 로그인해 주세요.")
+    if st.session_state.get("authenticated"):
+        st.session_state["_login_last_activity"] = now
         with st.sidebar:
             st.success("로그인됨")
             if st.button("로그아웃"):
-                # 다른 사람이 같은 브라우저를 열었을 때 고객/업로드 정보가 남지 않게 정리
                 st.session_state.clear()
                 st.rerun()
         return
 
     st.title("🔐 식혜명가 CRM 로그인")
     st.caption("고객 개인정보 보호를 위해 비밀번호가 필요합니다.")
+    if locked_until > now:
+        remaining = int((locked_until - now + 59) // 60)
+        st.error(f"로그인 시도가 많아 잠시 제한됐습니다. 약 {remaining}분 후 다시 시도해 주세요.")
+        st.stop()
 
     password = st.text_input("비밀번호", type="password")
     if st.button("로그인", type="primary"):
-        if password == app_password:
+        if hmac.compare_digest(str(password), app_password):
             st.session_state["authenticated"] = True
+            st.session_state["_login_last_activity"] = now
+            st.session_state.pop("_login_failed", None)
+            st.session_state.pop("_login_locked_until", None)
             st.rerun()
         else:
-            st.error("비밀번호가 틀렸습니다.")
-
+            failed = int(st.session_state.get("_login_failed", 0)) + 1
+            st.session_state["_login_failed"] = failed
+            if failed >= 5:
+                st.session_state["_login_locked_until"] = now + 15 * 60
+                st.session_state["_login_failed"] = 0
+                st.error("비밀번호 오류가 반복되어 15분간 로그인이 제한됩니다.")
+            else:
+                st.error("비밀번호가 틀렸습니다.")
     st.stop()
 
 
@@ -300,7 +328,7 @@ def read_excel_file(uploaded_file):
 
         try:
             office = msoffcrypto.OfficeFile(io.BytesIO(raw))
-            office.load_key(password=SMARTSTORE_PASSWORD)
+            office.load_key(password=str(st.secrets.get("SMARTSTORE_PASSWORD", SMARTSTORE_PASSWORD)))
             decrypted = io.BytesIO()
             office.decrypt(decrypted)
             decrypted.seek(0)
@@ -488,8 +516,27 @@ def fetch_all(table_name):
     step = 1000
     start = 0
 
+    # ORDER BY 없는 페이지 조회는 1만 건 이상에서 중복/누락 위험이 있다.
+    sort_columns = {"orders": "order_key", "blacklist": "customer_key"}
+    sort_column = sort_columns.get(table_name)
     while True:
-        res = sb.table(table_name).select("*").range(start, start + step - 1).execute()
+        query = sb.table(table_name).select("*")
+        if sort_column:
+            query = query.order(sort_column)
+        # 네트워크의 일시적인 DNS/연결 오류는 짧게 재시도하고,
+        # 계속 실패하면 개인정보/API 오류문 대신 원인 종류만 보여준다.
+        res = None
+        for attempt in range(3):
+            try:
+                res = query.range(start, start + step - 1).execute()
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Supabase {table_name} 목록 조회 실패 ({type(exc).__name__}). "
+                        "프로젝트 상태와 네트워크 연결을 확인해 주세요."
+                    ) from None
+                time.sleep((attempt + 1) * 0.35)
         data = res.data or []
         rows.extend(data)
         if len(data) < step:
@@ -542,9 +589,30 @@ def upsert_orders(order_level):
             sb.table("orders").upsert(chunk, on_conflict="order_key").execute()
             return len(chunk)
         except Exception as e:
+            # 연결/DNS/권한 장애는 데이터를 잘게 쪼개도 해결되지 않는다.
+            # 무한에 가까운 재시도(1000건→1건)를 피하고 즉시 안전하게 중단한다.
+            error_type = type(e).__name__.lower()
+            description = str(e).lower()[:500]
+            no_split = (
+                any(term in error_type for term in ("connect", "timeout", "network"))
+                or any(term in description for term in (
+                    "name or service not known", "temporary failure", "connection refused",
+                    "connection error", "timed out", "timeout", "network error", "dns",
+                    "401 unauthorized", "403 forbidden", "rate limit", "too many requests",
+                    "service unavailable", "bad gateway", "gateway timeout"
+                ))
+            )
+            if no_split:
+                raise RuntimeError(
+                    f"Supabase 주문 저장 연결 오류 ({type(e).__name__}). "
+                    "일부 앞선 주문은 저장됐을 수 있습니다. 상태를 확인한 후 다시 저장하세요."
+                ) from None
             if len(chunk) <= 1:
                 # 어떤 주문 1건 자체가 문제일 때만 화면에 명확히 표시
-                raise RuntimeError(f"저장 실패 주문: {chunk[0].get('order_key')} / 원인: {e}")
+                raise RuntimeError(
+                    f"주문 1건 저장 실패 ({type(e).__name__}). 앞서 성공한 묶음은 저장됐을 수 있습니다. "
+                    "실패 원인을 확인한 뒤 중복 업로드 대신 해당 주문을 점검해 주세요."
+                ) from None
 
             mid = len(chunk) // 2
             return save_chunk_safely(chunk[:mid]) + save_chunk_safely(chunk[mid:])
@@ -647,6 +715,15 @@ def save_customer_note(customer_key, customer_name, phone, address, memo):
 
 
 @st.cache_data(ttl=300, max_entries=3, show_spinner=False)
+def _excel_safe_value(value):
+    """사용자 입력 문자열이 Excel에서 계산식으로 실행되지 않게 텍스트로 내보낸다."""
+    if isinstance(value, str):
+        # leading whitespace / control characters can be ignored by spreadsheet viewers.
+        if value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+            return "'" + value
+    return value
+
+
 def to_excel_bytes(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -662,6 +739,10 @@ def to_excel_bytes(sheets):
                 elif safe_df[col].dtype == "object":
                     # 문자열 안에 섞인 UTC datetime도 안전하게 문자열 처리
                     safe_df[col] = safe_df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else x)
+            # 고객 이름/주소/메모/상품명 등도 스프레드시트 수식으로 해석되지 않도록 보호.
+            for col in safe_df.columns:
+                if safe_df[col].dtype == "object" or pd.api.types.is_string_dtype(safe_df[col]):
+                    safe_df[col] = safe_df[col].map(_excel_safe_value)
             safe_df.to_excel(writer, index=False, sheet_name=name[:31])
     output.seek(0)
     return output.getvalue()
@@ -853,8 +934,13 @@ def make_ai_context(customer_df, orders_db):
 
     product_text = ""
     if orders_db is not None and not orders_db.empty and "product_names" in orders_db.columns:
-        product_counts = orders_db["product_names"].astype(str).value_counts().head(10)
-        product_text = "\n".join([f"- {idx}: {val}건" for idx, val in product_counts.items()])
+        # 원본 상품명/옵션 문자열에는 판매자가 입력한 개인 정보가 포함될 수 있다.
+        # AI에는 식혜 5개 대분류의 주문 빈도만 전송하고 원본 텍스트는 전송하지 않는다.
+        counts = orders_db["product_names"].map(classify_label).fillna("기타/미분류").value_counts()
+        product_text = "\n".join(
+            f"- {LABELS.get(item, '기타/미분류')}: {int(total):,}건"
+            for item, total in counts.items()
+        )
 
     monthly_text = ""
     if orders_db is not None and not orders_db.empty and "order_date" in orders_db.columns:
@@ -1150,7 +1236,16 @@ def make_weekly_shipping_average(orders_db, weeks=8):
 def parse_uploaded_file_cached(filename, content):
     file_like = io.BytesIO(content)
     if filename.lower().endswith(".csv"):
-        raw = pd.read_csv(file_like)
+        # 쿠팡/네이버 CSV는 UTF-8과 CP949가 섞일 수 있음.
+        raw = None
+        for encoding in ("utf-8-sig", "cp949", "euc-kr"):
+            try:
+                raw = pd.read_csv(io.BytesIO(content), encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if raw is None:
+            raise ValueError("CSV 인코딩을 판별하지 못했습니다. UTF-8 또는 CP949로 저장해 주세요.")
     else:
         raw = read_excel_file(file_like)
     market = detect_market(filename, raw)
@@ -1161,8 +1256,16 @@ def parse_uploaded_file_cached(filename, content):
 @st.cache_data(ttl=900, max_entries=5, show_spinner=False)
 def _prepare_uploaded_files(file_blobs):
     """파일들의 바이트가 같으면 엑셀 파싱과 주문 단위 병합을 반복하지 않는다."""
+    import hashlib
     frames, errors, logs = [], [], []
+    seen_digests = set()
     for filename, content in file_blobs:
+        digest = hashlib.sha256(content).digest()
+        if digest in seen_digests:
+            logs.append({"파일명": filename, "채널": "", "원본행": 0,
+                         "정리행": 0, "상태": "중복 파일 제외"})
+            continue
+        seen_digests.add(digest)
         try:
             std, market, raw_len = parse_uploaded_file_cached(filename, content)
             frames.append(std)
@@ -1175,6 +1278,17 @@ def _prepare_uploaded_files(file_blobs):
     if not frames:
         return pd.DataFrame(), pd.DataFrame(), logs, errors
     raw = pd.concat(frames, ignore_index=True)
+    # 네이버 상품주문번호는 상품행 고유값이라 겹친 엑셀에서 다시 나오면 중복 출고다.
+    # 쿠팡 주문번호는 여러 상품행에 재사용되므로 여기에 같은 중복 제거를 적용하면 안 된다.
+    is_naver = raw["channel"].eq("네이버")
+    product_id = raw["product_order_no"].fillna("").astype(str).str.strip()
+    has_product_id = ~product_id.isin(("", "nan", "None", "none"))
+    repeated = is_naver & has_product_id & raw.duplicated(subset=["channel", "product_order_no"], keep="first")
+    if repeated.any():
+        skipped = int(repeated.sum())
+        raw = raw.loc[~repeated].reset_index(drop=True)
+        logs.append({"파일명": "여러 파일의 중복 상품주문번호", "채널": "네이버", "원본행": skipped,
+                     "정리행": 0, "상태": "중복 상품행 제외"})
     order_level = make_order_level(raw, use_strict=False)
     return raw, order_level, logs, errors
 
@@ -1256,7 +1370,7 @@ def _read_inventory_data(url, secret, nonce=0):
     rows = []
     start = 0
     while True:
-        result = client.table("inventory_daily").select("inventory_date,item_key,opening_qty,received_qty,auto_ship_qty,actual_ship_qty,closing_qty,note,updated_at").order("inventory_date", desc=True).range(start, start + 999).execute()
+        result = client.table("inventory_daily").select("inventory_date,item_key,opening_qty,received_qty,auto_ship_qty,actual_ship_qty,closing_qty,note,updated_at").order("inventory_date", desc=True).order("item_key").range(start, start + 999).execute()
         batch = result.data or []
         rows.extend(batch)
         if len(batch) < 1000:
@@ -1664,10 +1778,20 @@ def render_verified_inventory_history(history_rows, as_of):
     st.caption("같은 ISO 주차의 월~금을 비교하므로 해마다 날짜는 조금씩 다를 수 있습니다. 명절이나 배송 휴무일은 별도로 고려해 생산량을 결정하세요.")
 
 
-def save_inventory(records, summary_note=""):
+def save_inventory(records, summary_note="", expected_versions=None):
     client = _get_db_client()
     if client is None:
         raise RuntimeError("재고 DB 비밀키를 설정해야 저장할 수 있습니다.")
+    # 두 화면에서 같은 날짜를 열어놓고 저장할 때 조용히 덮어쓰지 않도록 점검.
+    # 완전한 원자적 잠금은 아니지만, 실수로 과거 스냅샷을 저장하는 일을 줄인다.
+    if expected_versions is not None and records:
+        save_day = str(records[0]["inventory_date"])
+        current_data = client.table("inventory_daily").select("item_key,updated_at").eq("inventory_date", save_day).execute()
+        live_versions = {str(row["item_key"]): str(row.get("updated_at", ""))
+                         for row in (current_data.data or [])}
+        expected = {str(key): str(version) for key, version in expected_versions.items()}
+        if any(live_versions.get(key, "") != expected.get(key, "") for key in KEYS):
+            raise RuntimeError("다른 화면에서 오늘 재고가 변경됐습니다. 새로고침해 최신 수량을 확인한 다음 저장해 주세요.")
     # 재고 재저장 시 같은 날짜·품목 행은 업데이트된다. 이전 재고는 추가로 차감되지 않는다.
     payload = []
     for r in records:
@@ -1852,7 +1976,8 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
     if st.button("💾 오늘 재고 최종 저장", type="primary", use_container_width=True,
                  disabled=negative or bool(error)):
         try:
-            audit_ok = save_inventory(records, note)
+            expected_versions = {key: str(today_saved.get(key, {}).get("updated_at", "")) for key in KEYS}
+            audit_ok = save_inventory(records, note, expected_versions=expected_versions)
             st.success("오늘 5개 품목의 실출고량과 남은 재고를 날짜별로 확정 저장했습니다. 같은 날 재저장하면 최신 값으로 수정됩니다.")
             if not audit_ok:
                 st.warning("최종 재고는 저장됐지만 변경 이력 저장은 실패했습니다.")
@@ -1897,7 +2022,7 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
 # 앱 시작
 # =========================
 st.title("📦 식혜명가 저장형 고객 CRM")
-st.caption("엑셀 업로드 → 오늘 재구매/VIP/블랙 즉시 확인 → DB 누적 저장까지 한 번에 처리합니다.")
+st.caption("쿠팡·네이버 주문부터 재고·고객·전년 실적까지 한 곳에서 확인합니다.")
 
 if sb is None:
     st.markdown("""
@@ -1968,6 +2093,16 @@ if tab_upload.open:
                     st.dataframe(log_df, use_container_width=True, hide_index=True)
             for name, msg in errors:
                 st.error(f"{name}: {msg}")
+            if not raw_orders.empty and len(raw_orders["source_file"].unique()) > 1:
+                # 동일 주문이 서로 다른 쿠팡 엑셀에 나타날 경우 서로 다른 상품행일 수도 있다.
+                # 자동 삭제하지 않고 중복 출고 가능성을 안내해 사람이 확인하도록 한다.
+                cp = raw_orders[raw_orders["channel"].eq("쿠팡")]
+                if not cp.empty:
+                    overlap = cp.groupby("order_key")["source_file"].nunique()
+                    count = int(overlap.gt(1).sum())
+                    if count:
+                        st.warning(f"서로 다른 쿠팡 파일에 동일 주문번호 {count:,}건이 있습니다. "
+                                   "수량이 중복 계산될 수 있으니 오늘 출고 수량을 확인해 주세요.")
 
             if not raw_orders.empty:
                 # 고객 신규/재구매 판정은 파일 변경 또는 주문 DB 갱신 시에만 다시 실행한다.
@@ -2031,16 +2166,27 @@ if tab_upload.open:
 if tab_upload.open:
     st.stop()
 
-# DB 데이터 로드: 선택한 화면에 필요한 자료만 조회한다.
-orders_db = fetch_orders_as_order_level()
+# DB 데이터 로드: 재고관리는 실제 출고 스냅샷만 필요하므로 주문 1만여 건 전체 조회 생략.
+# 다른 모든 탭은 기존 주문 DB를 읽어 기존 동작을 유지한다.
+orders_db = pd.DataFrame() if tab_inventory.open else fetch_orders_as_order_level()
 black_df = (fetch_blacklist() if any(t.open for t in
             (tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_download))
             else pd.DataFrame())
 
 if orders_db.empty:
+    if tab_inventory.open:
+        with tab_inventory:
+            render_inventory(
+                raw_orders=st.session_state.get("today_raw_orders", pd.DataFrame()),
+                orders_db=orders_db,
+                shipping_summary_func=make_shipping_summary,
+                infer_shipping_item=infer_shipping_item,
+            )
     if tab_dashboard.open:
         with tab_dashboard:
             st.info("아직 저장된 주문 DB가 없습니다. 먼저 엑셀을 업로드하고 DB에 저장하세요.")
+    if tab_today.open or tab_customers.open:
+        st.info("저장된 주문 자료가 없습니다. 엑셀 업로드에서 저장을 확인해 주세요.")
     st.stop()
 
 needs_customer_profile = any(t.open for t in (tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_download))
@@ -2175,7 +2321,13 @@ if tab_today.open:
 
 
 # =========================
-# V20 경영 대시보드: 기존 DB를 읽기만 하는 순수 계산 함수
+# V22 판매/고객/생산 경영 대시보드
+# - 기존 DB에 쓰기 작업 없음
+# - 주문 건수와 실제 병 수량을 명확하게 구분
+# - 전년 비교는 같은 날짜까지, 미완료 기간은 별도 표기
+# =========================
+# =========================
+# V22 경영 대시보드: 기존 DB를 읽기만 하는 순수 계산 함수
 # =========================
 @st.cache_data(ttl=180, max_entries=4, show_spinner=False)
 def _v20_orders(orders):
@@ -2207,50 +2359,6 @@ def _v20_compare(sales, days, today):
     prev = _v20_period_count(sales, end - timedelta(days=2*days-1), end - timedelta(days=days))
     pct = (cur - prev) / prev * 100 if prev > 0 else None
     return cur, prev, pct
-
-
-@st.cache_data(ttl=180, max_entries=4, show_spinner=False)
-def _v20_repurchase(sales, today):
-    """구매 간격(동일 날짜 복수 주문 제외), 60일 재구매 전환율(관찰기간 확보 코호트)."""
-    result = {"intervals": [], "median": None, "eligible": 0, "converted": 0,
-              "churn": pd.DataFrame(columns=["고객", "구매횟수", "마지막 구매", "평소 간격(일)", "경과(일)", "지연 정도"])}
-    if sales.empty:
-        return result
-    eligible, converted, intervals, churn_rows = 0, 0, [], []
-    named = "receiver_name" if "receiver_name" in sales else ("buyer_name" if "buyer_name" in sales else None)
-    for key, group in sales[sales["analysis_customer_key"].str.len() > 0].groupby("analysis_customer_key", sort=False):
-        days = sorted(group["local_day"].dropna().unique())
-        if not days:
-            continue
-        if days[0] <= today-timedelta(days=60):
-            eligible += 1
-            if len(days) >= 2 and (days[1]-days[0]).days <= 60:
-                converted += 1
-        if len(days) < 2:
-            continue
-        gaps = [(y-x).days for x, y in zip(days[:-1], days[1:]) if (y-x).days > 0]
-        intervals.extend(gaps)
-        if gaps:
-            normal = float(pd.Series(gaps).median())
-            elapsed = (today-days[-1]).days
-            # 2회 이상 구매한 고객만; 본인 구매주기의 2배 이상 지연 + 최소 45일
-            if elapsed >= max(45, 2*normal):
-                customer_name = "고객"
-                if named:
-                    nonempty = group[named].dropna().astype(str)
-                    nonempty = nonempty[nonempty.str.strip() != ""]
-                    if not nonempty.empty:
-                        customer_name = nonempty.iloc[-1]
-                churn_rows.append({"고객": customer_name, "구매횟수": len(group),
-                                   "마지막 구매": days[-1].isoformat(), "평소 간격(일)": round(normal),
-                                   "경과(일)": elapsed, "지연 정도": round(elapsed/max(1,normal),1)})
-    result["intervals"] = intervals
-    result["median"] = float(pd.Series(intervals).median()) if intervals else None
-    result["eligible"] = eligible
-    result["converted"] = converted
-    if churn_rows:
-        result["churn"] = pd.DataFrame(churn_rows).sort_values("지연 정도", ascending=False).reset_index(drop=True)
-    return result
 
 
 def _v20_complete_weeks(inventory_rows, today, lookback=4):
@@ -2338,223 +2446,436 @@ def _v20_delta(pct):
     return f"{pct:+.1f}%" if pct is not None else "이전 기간 0건"
 
 
+
+def _v22_previous_year(day):
+    """2월 29일은 전년의 2월 28일과 비교."""
+    try:
+        return day.replace(year=day.year - 1)
+    except ValueError:
+        return date(day.year - 1, 2, 28)
+
+
+def _v22_pct(cur, prev):
+    return round((cur - prev) / prev * 100, 1) if prev else None
+
+
+def _v22_pct_label(pct):
+    return f"{pct:+.1f}%" if pct is not None else "비교 불가"
+
+
+def _v22_yoy(sales, start, end):
+    """올해와 전년의 동일 월일 범위; 주기적 판매/캠페인 비용 데이터가 아님."""
+    if start > end:
+        return {"now": None, "before": None, "pct": None, "range": None}
+    old_start, old_end = _v22_previous_year(start), _v22_previous_year(end)
+    current = _v20_period_count(sales, start, end)
+    previous = _v20_period_count(sales, old_start, old_end)
+    return {"now": current, "before": previous, "pct": _v22_pct(current, previous),
+            "range": f"{old_start:%Y.%m.%d}~{old_end:%m.%d}"}
+
+
+def _v22_dates_for_month(month, as_of):
+    """선택 월의 전년 비교는 오늘이 포함된 미완료 월만 어제까지 자른다."""
+    year, month_no = map(int, month.split("-"))
+    start = date(year, month_no, 1)
+    if month_no == 12:
+        next_start = date(year + 1, 1, 1)
+    else:
+        next_start = date(year, month_no + 1, 1)
+    end = min(next_start - timedelta(days=1), as_of)
+    return start, end
+
+
+@st.cache_data(ttl=180, max_entries=4, show_spinner=False)
+def _v22_repurchase(sales, as_of):
+    """60일 비율 외에 30/90일 코호트 비교. 이탈 위험 목록은 생성하지 않음."""
+    out = {"median": None, "intervals": [], "cohorts": {30: (0, 0), 60: (0, 0), 90: (0, 0)}}
+    if sales.empty or "analysis_customer_key" not in sales:
+        return out
+    valid = sales.loc[
+        (sales["analysis_customer_key"].astype(str).str.strip() != "")
+        & (sales["local_day"] <= as_of),
+        ["analysis_customer_key", "local_day"]
+    ].drop_duplicates().sort_values(["analysis_customer_key", "local_day"])
+    if valid.empty:
+        return out
+    eligible = {window: 0 for window in (30, 60, 90)}
+    converted = {window: 0 for window in (30, 60, 90)}
+    intervals = []
+    for _, group in valid.groupby("analysis_customer_key", sort=False):
+        dates = group["local_day"].tolist()
+        first = dates[0]
+        second_gap = (dates[1] - first).days if len(dates) >= 2 else None
+        for window in (30, 60, 90):
+            if (as_of - first).days >= window:
+                eligible[window] += 1
+                if second_gap is not None and second_gap <= window:
+                    converted[window] += 1
+        intervals.extend([(b - a).days for a, b in zip(dates, dates[1:])])
+    out["intervals"] = intervals
+    out["median"] = float(pd.Series(intervals).median()) if intervals else None
+    out["cohorts"] = {w: (eligible[w], converted[w]) for w in (30, 60, 90)}
+    return out
+
+
+def _v22_customer_split(sales, start, end):
+    """선택 기간에 주문한 고객 중 첫 구매일이 기간 안인 신규/이전 구매자 구분."""
+    if sales.empty or start > end:
+        return {"new": 0, "returning": 0, "unknown": 0}
+    keyed = sales[sales["analysis_customer_key"].astype(str).str.strip() != ""]
+    if keyed.empty:
+        return {"new": 0, "returning": 0, "unknown": _v20_period_count(sales, start, end)}
+    firsts = keyed.groupby("analysis_customer_key")["local_day"].min()
+    active = keyed[keyed["local_day"].between(start, end)]["analysis_customer_key"].drop_duplicates()
+    first_dates = active.map(firsts)
+    new = int(first_dates.ge(start).sum())
+    returning = int(first_dates.lt(start).sum())
+    unknown = int(sales[sales["local_day"].between(start, end)]["analysis_customer_key"].astype(str).str.strip().eq("").sum())
+    return {"new": new, "returning": returning, "unknown": unknown}
+
+
+def _v22_channel_compare(sales, start, end):
+    """채널별 현재 vs 전년 동기간 (주문 건수)."""
+    rows=[]
+    for channel in ("쿠팡", "네이버"):
+        data = sales[sales["channel"] == channel]
+        r = _v22_yoy(data, start, end)
+        rows.append({"채널": channel, "현재 주문": r["now"] or 0,
+                     "작년 동기간": r["before"] or 0, "전년 대비": _v22_pct_label(r["pct"])})
+    return pd.DataFrame(rows)
+
+
+def _v22_month_frame(sales, as_of):
+    """자료가 있는 전체 기간을 달력 월로 복원. 진행 중인 이번 달은 진행 중으로 표시."""
+    if sales.empty:
+        return pd.DataFrame(columns=["month", "orders", "short", "state"])
+    month_counts = sales[sales["local_day"] <= as_of].groupby("month").size()
+    if month_counts.empty:
+        return pd.DataFrame(columns=["month", "orders", "short", "state"])
+    month_index = pd.period_range(month_counts.index.min(),
+                                  min(month_counts.index.max(),as_of.strftime("%Y-%m")),freq="M")
+    frame = pd.DataFrame({"month": month_index.astype(str)})
+    frame["orders"] = frame["month"].map(month_counts).fillna(0).astype(int)
+    frame["short"] = frame["month"].str[2:4] + "." + frame["month"].str[5:7]
+    frame["state"] = frame["month"].apply(lambda x: "진행 중" if x == as_of.strftime("%Y-%m") else "완료")
+    return frame
+
+
+def _v22_kpi(title, current, compare, note, suffix="건"):
+    if current is None:
+        st.metric(title, "—", delta=None)
+    else:
+        st.metric(title, f"{current:,}{suffix}",
+                  delta=(f"전년 {_v22_pct_label(compare['pct'])}" if compare["pct"] is not None else None))
+    st.caption(note)
+
+
+def _v22_brief(yoy_current, yoy_last, yoy_year, seven_delta, last_db, as_of):
+    """AI 호출 없이 확정 DB 숫자만 이용한 간결한 브리핑."""
+    parts=[]
+    if yoy_current["pct"] is not None:
+        word="증가" if yoy_current["pct"] >= 0 else "감소"
+        parts.append(f"이번 달 주문이 전년 동기간 대비 {abs(yoy_current['pct']):.1f}% {word}했습니다.")
+    else:
+        parts.append("이번 달은 전년 동기간에 주문 기록이 없어 증가율을 계산할 수 없습니다.")
+    if seven_delta is not None:
+        word="증가" if seven_delta >= 0 else "감소"
+        parts.append(f"최근 완료 7일 주문은 직전 7일보다 {abs(seven_delta):.1f}% {word}했습니다.")
+    if last_db is None:
+        parts.append("주문 DB에 날짜 기록이 없습니다.")
+    elif (as_of - last_db).days >= 3:
+        parts.append(f"마지막 주문 기록은 {last_db:%m/%d}입니다. 최근 엑셀이 아직 저장되지 않았다면 비교값이 작게 나올 수 있습니다.")
+    return parts
+
+
+def _v22_monthly_selection_chart(visible, as_of):
+    """12~24개월 막대 선택 시 고객이 수치를 크게 읽을 수 있게 반환."""
+    selection = alt.selection_point(name="month_pick_v22", fields=["month"], on="click", clear="dblclick")
+    xorder = list(visible["month"])
+    chart = alt.Chart(visible).mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5).encode(
+        x=alt.X("month:N", sort=xorder, title=None,
+                axis=alt.Axis(labelAngle=0, labelFontSize=15, labelPadding=12,
+                              labelOverlap="greedy", labelExpr="substring(datum.label,2,4) + '.' + substring(datum.label,5,7)")),
+        y=alt.Y("orders:Q", title="주문 건수", axis=alt.Axis(tickMinStep=1)),
+        color=alt.condition(selection, alt.value("#1d4ed8"), alt.value("#7aa7ee")),
+        tooltip=[alt.Tooltip("month:N", title="연·월"), alt.Tooltip("orders:Q",title="주문 건수",format=",d"),
+                 alt.Tooltip("3개월 평균:Q",title="3개월 평균", format=".1f"),
+                 alt.Tooltip("state:N",title="상태")]
+    ).add_params(selection)
+    state = _v20_big_chart(chart, height=350, key="v22_month_selection", selectable=True)
+    chosen = None
+    try:
+        selected = state.selection.get("month_pick_v22", [])
+        if selected and isinstance(selected, list):
+            chosen = selected[0].get("month")
+    except (AttributeError, KeyError, TypeError, IndexError):
+        pass
+    if chosen not in set(visible["month"]):
+        chosen = visible["month"].iloc[-1]
+    return chosen
+
+
+def _v22_actual_weekday(inventory_history, as_of):
+    """하루 전체 다섯 제품이 저장된 날짜만 실제 출고 요일 평균에 반영."""
+    calendar = _recorded_inventory_calendar(inventory_history)
+    start = as_of - timedelta(weeks=8)
+    byday = {i: [] for i in range(7)}
+    for d, inventory_items in calendar.items():
+        if not (start <= d <= as_of) or d.weekday() >= 5:
+            continue
+        if all(key in inventory_items for key in KEYS):
+            byday[d.weekday()].append(sum(_safe_int(inventory_items[key]) for key in KEYS))
+    names = ["월","화","수","목","금"]
+    return pd.DataFrame({"요일": names, "평균 출고(병)": [round(sum(byday[i])/len(byday[i]),1) if byday[i] else None for i in range(5)],
+                         "기록일": [len(byday[i]) for i in range(5)]})
+
+
 if tab_dashboard.open:
     with tab_dashboard:
-        today_v20 = datetime.now(KST).date()
-        sales_v20 = _v20_orders(orders_db)
-        total_orders = len(sales_v20)
-        total_customers = len(customer_df)
-        repeat_customers = int((customer_df["order_count"] >= 2).sum())
-        repeat_rate = 100 * repeat_customers / total_customers if total_customers else 0
-        first_time = total_customers-repeat_customers
-        vip_count = int((customer_df["order_count"] >= 5).sum())
-        week_now, week_prev, week_change = _v20_compare(sales_v20,7,today_v20)
-        month_now, month_prev, month_change = _v20_compare(sales_v20,30,today_v20)
+        today_v22 = datetime.now(KST).date()
+        as_of = today_v22 - timedelta(days=1)  # 완료된 날짜까지만 비교
+        sales = _v20_orders(orders_db)
+        sales = sales[sales["local_day"] <= as_of].copy() if not sales.empty else sales
+        customer_total = len(customer_df)
+        repeat_total = int((customer_df["order_count"] >= 2).sum()) if not customer_df.empty else 0
+        vip_total = int((customer_df["order_count"] >= 5).sum()) if not customer_df.empty else 0
 
-        st.title("📊 식혜명가 경영 대시보드")
-        st.caption("기존 주문 DB와 확정 저장한 출고 기록 기준 · 주문건수와 출고 병수는 구분 표시 · 오늘 진행 중 주문은 기간 비교에서 제외")
-        c1,c2,c3 = st.columns(3)
-        c1.metric("누적 주문", f"{total_orders:,}건")
-        c2.metric("전체 고객", f"{total_customers:,}명")
-        c3.metric("누적 재구매 고객 비중", f"{repeat_rate:.1f}%", help="전체 고객 중 주문 2회 이상인 고객 비중. 첫 구매 후 60일 재구매 전환율과 다릅니다.")
-        c4,c5,c6 = st.columns(3)
-        c4.metric("최근 7일 주문", f"{week_now:,}건", delta=_v20_delta(week_change), delta_color="off" if week_change is None else "normal")
-        c5.metric("최근 30일 주문", f"{month_now:,}건", delta=_v20_delta(month_change), delta_color="off" if month_change is None else "normal")
-        c6.metric("VIP 고객 (5회 이상)", f"{vip_count:,}명")
-        st.caption("최근 7·30일 증감률은 각각 직전 동일 일수와 비교합니다. 판매 채널, 요일, 명절 효과는 상세 화면에서 확인하세요.")
-        latest_day = max(sales_v20["local_day"]) if not sales_v20.empty else None
-        if latest_day is not None and (today_v20-latest_day).days > 7:
-            st.warning(f"⚠️ 마지막 주문 데이터가 {latest_day:%Y-%m-%d}입니다. 최근 주문 엑셀을 DB에 저장하지 않았다면 판매 추이가 실제 상황과 다를 수 있습니다.")
-        if week_change is not None and week_prev>=10 and week_change < -20:
-            st.warning(f"📉 최근 7일 주문이 직전 7일 대비 {abs(week_change):.1f}% 감소했습니다. 채널별 변화를 확인해 주세요.")
+        this_month_start = today_v22.replace(day=1)
+        last_month_end = this_month_start - timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+        this_year_start = today_v22.replace(month=1, day=1)
+        yoy_current = _v22_yoy(sales, this_month_start, as_of)
+        yoy_last = _v22_yoy(sales, last_month_start, last_month_end)
+        yoy_ytd = _v22_yoy(sales, this_year_start, as_of)
+        week_now, week_prev, week_change = _v20_compare(sales, 7, today_v22)
+        thirty_now, thirty_prev, thirty_change = _v20_compare(sales, 30, today_v22)
+        latest_record = max(sales["local_day"]) if not sales.empty else None
 
-        st.markdown("""<style>
-            .vg-tooltip, #vg-tooltip-element, #vg-tooltip-element table {font-size:18px !important;line-height:1.6!important;}
-            .vg-tooltip td,.vg-tooltip th{font-size:17px!important;padding:7px 12px!important;}
-            div[data-testid="stAltairChart"]{min-height:280px;}
-            </style>""", unsafe_allow_html=True)
-        panels=st.tabs(["📈 판매 흐름", "👥 고객·재구매", "🏭 생산·재고", "🛒 채널·명절"], on_change="rerun", key="crm_dashboard_panels")
+        st.title("📊 식혜명가 경영 대시보드 V22")
+        st.caption(f"2026년형 판매·고객·생산 관리 · 비교 마감 {as_of:%Y.%m.%d} (어제까지) · **주문 건수 기준**")
+
+        a,b,c = st.columns(3)
+        with a:
+            _v22_kpi("이번 달 주문", yoy_current["now"], yoy_current,
+                     f"{this_month_start:%m/%d}~{as_of:%m/%d}, 작년 같은 날짜까지")
+        with b:
+            _v22_kpi("지난달 확정 주문", yoy_last["now"], yoy_last,
+                     f"{last_month_start:%Y.%m} 전체 vs 전년 동월")
+        with c:
+            _v22_kpi("올해 누적 주문", yoy_ytd["now"], yoy_ytd,
+                     f"1/1~{as_of:%m/%d}, 작년 동기간")
+
+        a,b,c = st.columns(3)
+        a.metric("최근 완료 7일", f"{week_now:,}건", delta=_v20_delta(week_change),
+                 delta_color="off" if week_change is None else "normal")
+        b.metric("최근 완료 30일", f"{thirty_now:,}건", delta=_v20_delta(thirty_change),
+                 delta_color="off" if thirty_change is None else "normal")
+        c.metric("재구매 고객 비중", f"{repeat_total/customer_total*100:.1f}%" if customer_total else "—",
+                 help="DB 전체 고객 중 주문 2회 이상 고객 비중. 기간 코호트 재구매율과는 다릅니다.")
+
+        with st.expander("📌 전년 비교 상세 수치 확인", expanded=False):
+            data=[]
+            for label,item in [("이번 달 (완료일 기준)",yoy_current),("지난달 전체",yoy_last),("올해 누적",yoy_ytd)]:
+                data.append({"구분":label,"올해":item["now"] if item["now"] is not None else "—",
+                             "작년":item["before"] if item["before"] is not None else "—",
+                             "증감률":_v22_pct_label(item["pct"]),"작년 비교기간":item["range"] or "—"})
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+            st.caption("작년 0건이면 증가율은 계산하지 않습니다. 2월 29일은 전년 2월 28일과 비교합니다. 주문 취소·환불은 원본 DB에 반영된 범위에서만 집계됩니다.")
+
+        st.subheader("📝 이번 주 판매 브리핑")
+        for i, line in enumerate(_v22_brief(yoy_current,yoy_last,yoy_ytd,week_change,latest_record,as_of), start=1):
+            st.markdown(f"**{i}.** {line}")
+        if latest_record and (as_of-latest_record).days >= 3:
+            st.warning(f"주문 DB 마지막 기록 {latest_record:%Y.%m.%d}. 최신 파일을 저장하지 않았다면 비교 수치가 실제보다 적을 수 있어요.")
+        if not sales.empty and sales["local_day"].min() > _v22_previous_year(this_month_start):
+            st.info("전년도 해당 기간의 DB 기록이 충분하지 않을 수 있습니다. 집계 시작일을 확인하세요.")
+
+        st.divider()
+        panels = st.tabs(["📈 판매·전년 비교", "👥 신규·재구매", "🏭 생산·재고", "🛒 채널·명절"],
+                         on_change="rerun", key="crm_dashboard_panels_v22")
 
         if panels[0].open:
             with panels[0]:
                 st.subheader("월별 주문 흐름")
-                period_choice = st.segmented_control("표시 기간", ["최근 12개월", "최근 24개월", "연도별 전체"], default="최근 12개월", key="v20_period")
-                monthly=sales_v20.groupby("month").size().rename("orders").reset_index().sort_values("month")
-                if not monthly.empty:
-                    span=pd.period_range(monthly["month"].iloc[0], monthly["month"].iloc[-1],freq="M")
-                    monthly=pd.DataFrame({"month":span.astype(str)}).merge(monthly,on="month",how="left").fillna({"orders":0})
-                    monthly["orders"]=monthly["orders"].astype(int)
-                    if period_choice=="최근 12개월":
+                view = st.segmented_control("표시 기간", ["최근 12개월", "최근 24개월", "연도별"],
+                                             default="최근 12개월",key="v22_month_period")
+                monthly = _v22_month_frame(sales,as_of)
+                if monthly.empty:
+                    st.info("표시할 주문 데이터가 없습니다.")
+                else:
+                    if view == "최근 12개월":
                         visible=monthly.tail(12).copy()
-                    elif period_choice=="최근 24개월":
+                    elif view == "최근 24개월":
                         visible=monthly.tail(24).copy()
                     else:
-                        years=sorted(monthly["month"].str[:4].unique(),reverse=True)
-                        yr=st.selectbox("조회 연도",years,key="v20_month_year")
+                        years=sorted(monthly["month"].str[:4].unique().tolist(),reverse=True)
+                        yr=st.selectbox("연도 선택",years,key="v22_year")
                         visible=monthly[monthly["month"].str.startswith(yr)].copy()
-                    visible["3개월 평균"]=visible["orders"].rolling(3,min_periods=1).mean().round(1)
-                    visible["짧은 월"]=visible["month"].str[5:7].astype(int).astype(str)+"월"
-                    # 클릭한 막대의 수치를 차트 아래에 큰 글씨로 표시한다.
-                    selection=alt.selection_point(name="month_pick",fields=["month"],on="click",clear="dblclick")
-                    bars=alt.Chart(visible).mark_bar(cornerRadiusTopLeft=4,cornerRadiusTopRight=4).encode(
-                        x=alt.X("month:N",sort=list(visible["month"]),title=None,
-                                axis=alt.Axis(labelFontSize=16,labelAngle=-25, labelOverlap=False,
-                                              labelExpr="substring(datum.label,2,4) + '.' + substring(datum.label,5,7)")),
-                        y=alt.Y("orders:Q",title="주문 건수",axis=alt.Axis(tickMinStep=1)),
-                        color=alt.condition(selection,alt.value("#1d4ed8"),alt.value("#60a5fa")),
-                        tooltip=[alt.Tooltip("month:N",title="월"),alt.Tooltip("orders:Q",title="주문 건수",format=",d"),
-                                 alt.Tooltip("3개월 평균:Q",title="3개월 평균",format=".1f")]
-                    ).add_params(selection)
-                    state=_v20_big_chart(bars,330,key="v20_month_chart",selectable=True)
-                    chosen=None
-                    try:
-                        selected=state.selection.get("month_pick",[])
-                        if selected and isinstance(selected,list):
-                            chosen=selected[0].get("month")
-                    except (AttributeError,KeyError,TypeError,IndexError):
-                        pass
-                    if chosen not in set(visible["month"]):
-                        chosen=visible["month"].iloc[-1]
-                    count=int(visible.loc[visible["month"]==chosen,"orders"].iloc[0])
-                    st.metric(f"선택 월 · {chosen}",f"{count:,}건")
-                    st.caption("막대를 한 번 클릭하면 해당 월 주문량을 크게 표시합니다. 더블클릭하면 선택이 초기화됩니다. 월은 한국시간 기준.")
-                    with st.expander("월별 주문 수치 표 보기",expanded=False):
-                        st.dataframe(visible[["month","orders","3개월 평균"]].rename(columns={"month":"월","orders":"주문 건수"}),use_container_width=True,hide_index=True)
-                else:
-                    st.info("월별 주문 기록이 없습니다.")
+                    visible["3개월 평균"] = visible["orders"].rolling(3,min_periods=1).mean().round(1)
+                    selected_month = _v22_monthly_selection_chart(visible,as_of)
+                    month_count=int(visible.loc[visible["month"]==selected_month,"orders"].iloc[0])
+                    s,e=_v22_dates_for_month(selected_month,as_of)
+                    comparison=_v22_yoy(sales,s,e)
+                    p,q=st.columns(2)
+                    p.metric(f"선택 월 {selected_month}",f"{month_count:,}건")
+                    q.metric("선택 월 전년 대비",_v22_pct_label(comparison["pct"]),
+                             help="진행 중인 달은 같은 날짜까지만 비교하며, 전년도 0건이면 비교 불가입니다.")
+                    st.caption("막대를 클릭해 수치를 크게 확인하세요. 연도를 포함한 축 글씨는 가로 방향 고정입니다. 이번 달은 진행 중인 달이에요.")
+                    with st.expander("월별 수치 표 자세히 보기"):
+                        st.dataframe(visible[["month","orders","3개월 평균","state"]].rename(columns={"month":"월","orders":"주문 건수","state":"기록 상태"}),
+                                     use_container_width=True,hide_index=True)
+
                 st.divider()
-                st.subheader("월~일 요일별 주문 패턴")
-                anchor=today_v20-timedelta(days=today_v20.weekday())
+                st.subheader("요일별 주문 패턴")
+                anchor=today_v22-timedelta(days=today_v22.weekday())
                 start=anchor-timedelta(weeks=8)
-                window=sales_v20[sales_v20["local_day"].between(start,anchor-timedelta(days=1))]
-                day_counts=window.groupby("weekday").size().to_dict()
-                weekday_names=["월","화","수","목","금","토","일"]
-                pattern=pd.DataFrame({"요일":weekday_names,"주문 평균":[round(day_counts.get(i,0)/8,1) for i in range(7)]})
-                day_chart=alt.Chart(pattern).mark_bar(size=38,cornerRadiusEnd=4).encode(
-                    x=alt.X("요일:N",sort=weekday_names,title=None), y=alt.Y("주문 평균:Q",title="하루 평균 주문(건)"),
-                    tooltip=[alt.Tooltip("요일:N"),alt.Tooltip("주문 평균:Q",format=".1f")],color=alt.value("#2563eb"))
-                _v20_big_chart(day_chart,265)
-                st.caption(f"직전 완료된 8주 ({start:%Y-%m-%d} ~ {(anchor-timedelta(days=1)):%Y-%m-%d})의 주문일 기준 요일당 평균. 출고요일과 다를 수 있습니다.")
+                prior=sales[sales["local_day"].between(start,anchor-timedelta(days=1))]
+                order_days=prior.groupby("weekday").size().to_dict()
+                names=["월","화","수","목","금","토","일"]
+                pattern=pd.DataFrame({"요일":names,"하루 평균 주문": [round(order_days.get(i,0)/8,1) for i in range(7)]})
+                daychart=alt.Chart(pattern).mark_bar(size=46,cornerRadiusTopLeft=5,cornerRadiusTopRight=5).encode(
+                    x=alt.X("요일:N",sort=names,title=None,
+                            axis=alt.Axis(labelAngle=0,labelFontSize=18,labelPadding=12,labelOverlap=False)),
+                    y=alt.Y("하루 평균 주문:Q",title="일 평균 주문(건)"),
+                    tooltip=[alt.Tooltip("요일:N"),alt.Tooltip("하루 평균 주문:Q",format=".1f")],
+                    color=alt.value("#2563eb"))
+                values=alt.Chart(pattern).mark_text(dy=-11,fontSize=17,fontWeight="bold",color="#1f2937").encode(
+                    x=alt.X("요일:N",sort=names),y="하루 평균 주문:Q",text=alt.Text("하루 평균 주문:Q",format=".1f"))
+                _v20_big_chart(daychart+values,320)
+                st.caption(f"직전 완료된 8주({start:%Y-%m-%d}~{(anchor-timedelta(days=1)):%Y-%m-%d})의 **주문일 기준** 요일당 평균. 실제 출고요일은 생산·재고 화면에서 별도 확인합니다.")
 
         if panels[1].open:
             with panels[1]:
-                customer_repeat = _v20_repurchase(sales_v20, today_v20)
-                st.subheader("재구매 실적")
-                col_a,col_b,col_c=st.columns(3)
-                col_a.metric("재구매 고객",f"{repeat_customers:,}명")
-                col_b.metric("구매 간격 중앙값",f"{customer_repeat['median']:.0f}일" if customer_repeat['median'] is not None else "기록 부족")
-                ratio=customer_repeat['converted']/customer_repeat['eligible']*100 if customer_repeat['eligible'] else None
-                col_c.metric("첫 구매 60일 내 재구매",f"{ratio:.1f}%" if ratio is not None else "기록 부족")
-                st.caption(f"60일 전까지 처음 구매한 고객 {customer_repeat['eligible']:,}명 중 60일 안에 다시 산 비율. 구매 간격은 같은 날 여러 주문을 제외한 서로 다른 구매일 기준.")
-                bins=[("1~7일",1,7),("8~30일",8,30),("31~60일",31,60),("61~90일",61,90),("91일 이상",91,10000000)]
-                gaps=customer_repeat['intervals']
-                if gaps:
-                    hist=pd.DataFrame({"기간":[x[0] for x in bins],"재구매 간격 수":[sum(lo<=g<=hi for g in gaps) for _,lo,hi in bins]})
-                    c=alt.Chart(hist).mark_bar(size=26).encode(
-                        y=alt.Y("기간:N",sort=[x[0] for x in bins],title=None),
-                        x=alt.X("재구매 간격 수:Q",title="구매 간격 사례 수"),tooltip=["기간:N",alt.Tooltip("재구매 간격 수:Q",format=",d")],
-                        color=alt.value("#2563eb"))
-                    _v20_big_chart(c,270)
+                st.subheader("신규 고객 vs 기존 고객")
+                split = _v22_customer_split(sales,this_month_start,as_of)
+                ca,cb,cc=st.columns(3)
+                ca.metric("이번 달 신규 구매 고객",f"{split['new']:,}명")
+                cb.metric("이번 달 기존 구매 고객",f"{split['returning']:,}명")
+                total_known=split['new']+split['returning']
+                cc.metric("기존 고객 비중",f"{split['returning']/total_known*100:.1f}%" if total_known else "—")
+                st.caption("이 달에 구매한 고유 고객을 최초 구매일 기준으로 구분합니다. DB에 없는 과거 주문은 반영할 수 없습니다.")
+                if split['unknown']:
+                    st.warning(f"고객 식별자가 없는 주문 {split['unknown']:,}건은 신규/기존 분류에서 제외했습니다.")
                 st.divider()
-                st.subheader("이탈 위험: 평소보다 구매가 늦어진 단골")
-                churn_df=customer_repeat['churn']
-                st.metric("지연 후보",f"{len(churn_df):,}명")
-                st.caption("서로 다른 날짜에 2번 이상 구매했고, 마지막 구매 후 45일 이상이면서 본인 구매 간격 중앙값의 2배 이상 경과한 경우. 확정 이탈이 아닌 관리 참고 명단입니다.")
-                with st.expander("지연 고객 목록 보기 (관리자 전용)", expanded=False):
-                    if churn_df.empty:
-                        st.info("해당 조건의 고객이 없습니다.")
-                    else:
-                        st.dataframe(churn_df.head(50),use_container_width=True,hide_index=True)
-                        st.caption("고객명만 표시하며 전화번호와 주소는 제외했습니다. 고객 CRM 탭에서 상세 확인 가능. 연락 전에 수신 동의 확인이 필요합니다.")
+                st.subheader("첫 구매 후 재구매 전환율")
+                report=_v22_repurchase(sales,as_of)
+                cols=st.columns(3)
+                for col,days in zip(cols,(30,60,90)):
+                    eligible,converted=report['cohorts'][days]
+                    with col:
+                        st.metric(f"{days}일 내 재구매", f"{converted/eligible*100:.1f}%" if eligible else "—",
+                                  help=f"첫 구매 후 {days}일의 관찰 기간이 지난 고객만 분모에 포함")
+                        st.caption(f"{converted:,}명 / 대상 {eligible:,}명")
+                st.caption("같은 날 여러 주문을 해도 '두 번째 구매일'로 세지 않습니다. 기간별로 분석 대상 고객 수가 다릅니다.")
+                st.metric("재구매 간격 중앙값",f"{report['median']:.0f}일" if report['median'] is not None else "기록 부족")
+                intervals=report['intervals']
+                if intervals:
+                    bins=[("1~7일",1,7),("8~30일",8,30),("31~60일",31,60),("61~90일",61,90),("91일 이상",91,100000)]
+                    frame=pd.DataFrame({"재구매 간격":[b[0] for b in bins],"건수":[sum(b[1]<=g<=b[2] for g in intervals) for b in bins]})
+                    bars=alt.Chart(frame).mark_bar(size=30,cornerRadiusEnd=4).encode(
+                        y=alt.Y("재구매 간격:N",sort=[b[0] for b in bins],title=None,axis=alt.Axis(labelAngle=0)),
+                        x=alt.X("건수:Q",title="구매 간격 사례"),color=alt.value("#2563eb"),
+                        tooltip=["재구매 간격:N",alt.Tooltip("건수:Q",format=",d")])
+                    _v20_big_chart(bars,290)
                 st.divider()
-                st.subheader("고객 구매횟수별 분포")
-                customer_oc=pd.to_numeric(customer_df['order_count'],errors='coerce').fillna(0)
-                buckets=[("1회",int((customer_oc==1).sum())),("2회",int((customer_oc==2).sum())),
-                         ("3회",int((customer_oc==3).sum())),("4회",int((customer_oc==4).sum())),
-                         ("5회 이상",int((customer_oc>=5).sum()))]
-                bucket_df=pd.DataFrame(buckets,columns=["구매횟수","고객수"])
-                b=alt.Chart(bucket_df).mark_bar(size=30,cornerRadiusEnd=4).encode(
-                    y=alt.Y("구매횟수:N",sort=[x[0] for x in buckets],title=None),
-                    x=alt.X("고객수:Q",title="고객 수"),
-                    tooltip=["구매횟수:N",alt.Tooltip("고객수:Q",format=",d")],color=alt.value("#f59e0b"))
-                _v20_big_chart(b,270)
+                st.subheader("고객 구매횟수 분포")
+                counts=pd.to_numeric(customer_df["order_count"],errors="coerce").fillna(0)
+                buck=[("1회",int((counts==1).sum())),("2회",int((counts==2).sum())),
+                      ("3회",int((counts==3).sum())),("4회",int((counts==4).sum())),
+                      ("5회 이상",int((counts>=5).sum()))]
+                distribution=pd.DataFrame(buck,columns=["구매횟수","고객 수"])
+                c=alt.Chart(distribution).mark_bar(size=30).encode(
+                    y=alt.Y("구매횟수:N",sort=[x[0] for x in buck],title=None,axis=alt.Axis(labelAngle=0)),
+                    x=alt.X("고객 수:Q",title="고객 수"),color=alt.value("#e59c29"),
+                    tooltip=["구매횟수:N",alt.Tooltip("고객 수:Q",format=",d")])
+                _v20_big_chart(c,290)
 
         if panels[2].open:
             with panels[2]:
-                st.subheader("다음 주 생산량 참고")
-                st.caption("여기서는 **매일 '재고관리 → 오늘 재고 최종 저장'**한 실제 출고 병 수량만 사용합니다. 원본 주문 DB의 주문 건수를 병수로 대체하지 않습니다.")
-                inventory_history, inv_error=fetch_inventory_rows()
-                if inv_error:
-                    st.warning(inv_error)
+                st.subheader("주간 생산량·재고 소진")
+                st.caption("실제 병 수는 **재고관리에서 매일 최종 저장한 품목별 출고량**만 사용합니다. 기존 주문 건수로 생산량을 추측하지 않습니다.")
+                history,inventory_error=fetch_inventory_rows()
+                if inventory_error:
+                    st.warning(inventory_error)
                 else:
-                    production_df, finished=_v20_production(inventory_history,today_v20)
-                    st.metric("최근 4주 중 완전히 기록한 평일 주간",f"{finished}/4주")
+                    production_df,full_weeks=_v20_production(history,today_v22)
+                    st.metric("최근 4주 중 평일 5일 모두 저장한 주",f"{full_weeks}/4주")
                     st.dataframe(production_df,use_container_width=True,hide_index=True)
-                    st.caption("생산 참고량 = 다음 주 평일 예상 출고 + 품목별 최소 보유기준 − 최근 저장 재고. **최근 완료 4주 중 최소 2주**의 월~금 모두 기록되고 재고가 7일 이내 갱신된 경우만 계산합니다. 0개 출고와 미기록을 구분합니다.")
-                    if finished < 2:
-                        st.info("현재는 실제 출고 기록이 부족해 생산량을 임의 예측하지 않습니다. 평일 5일을 하루도 빠짐없이 2주 이상 저장하면 수치가 나타납니다.")
-                    stale=production_df[production_df['기준']!='참고치']
-                    if not stale.empty and finished>=2:
-                        st.warning("일부 품목의 재고 기록이 오래됐거나 누락됐습니다. 생산 추천 전에 재고를 확인·저장해 주세요.")
-                    st.divider()
-                    st.subheader("품목별 재고 소진 위험")
-                    st.caption("소진 예상일은 판매·주말·휴무 변동이 반영되지 않은 단순 **영업일 환산 참고치**입니다. 품목별 부족 기준은 재고관리 설정과 동일합니다.")
-                    if not production_df.empty:
+                    st.caption("생산 참고량 = 주간 예상 출고 + 품목별 최소 확보재고 − 최신 재고. 출고 완전 기록 2주 이상, 7일 이내 재고 갱신시에만 표시해요.")
+                    if full_weeks < 2:
+                        st.info("완전히 기록한 평일 주가 2주 이상 쌓이면 예상 출고와 생산 참고량을 계산합니다. 미기록은 0출고로 계산하지 않습니다.")
+                    else:
                         chart_data=production_df[pd.to_numeric(production_df['소진 예상(영업일)'],errors='coerce').notna()].copy()
                         if not chart_data.empty:
-                            chart_data['일수']=pd.to_numeric(chart_data['소진 예상(영업일)'])
-                            dchart=alt.Chart(chart_data).mark_bar(size=26).encode(
-                                y=alt.Y('품목:N',sort=[p[1] for p in ITEMS],title=None),
-                                x=alt.X('일수:Q',title='예상 영업일'),color=alt.value('#f59e0b'),
-                                tooltip=['품목:N',alt.Tooltip('일수:Q',format='.1f')])
-                            _v20_big_chart(dchart,270)
-                        else:
-                            st.info("재고 소진 분석에 필요한 실제 출고 기록이 쌓이면 여기 표시됩니다.")
+                            st.subheader("품목별 예상 재고 소진일")
+                            chart_data['예상 영업일']=pd.to_numeric(chart_data['소진 예상(영업일)'])
+                            c=alt.Chart(chart_data).mark_bar(size=25).encode(
+                                y=alt.Y('품목:N',sort=[p[1] for p in ITEMS],title=None,axis=alt.Axis(labelAngle=0)),
+                                x=alt.X('예상 영업일:Q',title='평균 판매 속도 기준 영업일'),
+                                tooltip=['품목:N',alt.Tooltip('예상 영업일:Q',format='.1f')],color=alt.value('#f59e0b'))
+                            _v20_big_chart(c,290)
+                    st.divider()
+                    st.subheader("실제 출고요일 패턴 (월~금)")
+                    shipping_days = _v22_actual_weekday(history,today_v22)
+                    if shipping_days['기록일'].sum() == 0:
+                        st.info("아직 완전히 기록한 평일 출고 데이터가 없습니다.")
+                    else:
+                        st.dataframe(shipping_days,use_container_width=True,hide_index=True)
+                        filled=shipping_days.dropna(subset=['평균 출고(병)']).copy()
+                        if not filled.empty:
+                            x=alt.Chart(filled).mark_bar(size=42).encode(
+                                x=alt.X('요일:N',sort=['월','화','수','목','금'],title=None,
+                                        axis=alt.Axis(labelAngle=0,labelFontSize=17)),
+                                y=alt.Y('평균 출고(병):Q',title='병'),color=alt.value('#16a34a'),
+                                tooltip=['요일:N',alt.Tooltip('평균 출고(병):Q',format='.1f')])
+                            _v20_big_chart(x,260)
+                        st.caption('실제 출고량은 5품목을 모두 저장한 날짜만 이용합니다. 요일별 표본 수가 다르므로 참고용으로 보세요.')
 
         if panels[3].open:
             with panels[3]:
                 st.subheader("쿠팡 vs 네이버")
-                channel_summary=sales_v20.groupby('channel',dropna=False).agg(
-                    주문건수=('channel','size'),고객수=('analysis_customer_key','nunique')).reset_index().rename(columns={'channel':'채널'})
-                channel_summary=channel_summary[channel_summary['채널'].isin(['쿠팡','네이버','기타'])]
-                st.dataframe(channel_summary,use_container_width=True,hide_index=True)
-                st.caption("채널별 주문 건수와 해당 채널에 구매 기록이 있는 고유 고객 수입니다. 두 채널 모두 구매한 고객은 각 채널에서 한 번씩 집계될 수 있습니다.")
-                end_month=today_v20.strftime('%Y-%m')
-                recent_periods=pd.period_range(end=pd.Period(end_month,freq='M'),periods=6,freq='M').astype(str).tolist()
-                channel_recent=sales_v20[sales_v20['month'].isin(recent_periods)]
-                grouped=channel_recent.groupby(['month','channel']).size().rename('주문 건수').reset_index()
-                frame=pd.MultiIndex.from_product([recent_periods,['쿠팡','네이버']],names=['month','channel']).to_frame(index=False)
-                grouped=frame.merge(grouped,on=['month','channel'],how='left').fillna({'주문 건수':0})
+                channel_frame = _v22_channel_compare(sales,this_month_start,as_of)
+                st.dataframe(channel_frame,use_container_width=True,hide_index=True)
+                st.caption("이번 달 주문을 작년 같은 날짜까지 비교했습니다. 채널이 확인되지 않는 주문은 표에 포함하지 않았습니다.")
+                periods=pd.period_range(end=pd.Period(as_of.strftime('%Y-%m'),freq='M'),periods=6,freq='M').astype(str).tolist()
+                filtered=sales[sales['month'].isin(periods) & sales['channel'].isin(['쿠팡','네이버'])]
+                grouped=filtered.groupby(['month','channel']).size().rename('주문 건수').reset_index()
+                grid=pd.MultiIndex.from_product([periods,['쿠팡','네이버']],names=['month','channel']).to_frame(index=False)
+                grouped=grid.merge(grouped,on=['month','channel'],how='left').fillna({'주문 건수':0})
                 chart=alt.Chart(grouped).mark_bar().encode(
-                    x=alt.X('month:N',sort=recent_periods,title=None,axis=alt.Axis(labelAngle=-20)),
-                    y=alt.Y('주문 건수:Q',title='주문 건수',stack=None),
-                    color=alt.Color('channel:N',title='판매 채널',scale=alt.Scale(domain=['쿠팡','네이버'],range=['#2563eb','#16a34a'])),
+                    x=alt.X('month:N',sort=periods,title=None,
+                            axis=alt.Axis(labelAngle=0,labelFontSize=15,
+                                          labelExpr="substring(datum.label,2,4) + '.' + substring(datum.label,5,7)")),
+                    y=alt.Y('주문 건수:Q',title='건'),
+                    color=alt.Color('channel:N',title='판매채널',scale=alt.Scale(domain=['쿠팡','네이버'],range=['#2563eb','#16a34a'])),
                     xOffset='channel:N',tooltip=['month:N','channel:N',alt.Tooltip('주문 건수:Q',format=',.0f')])
-                _v20_big_chart(chart,300)
-                if '기타' in set(sales_v20['channel']):
-                    st.warning("일부 주문의 채널을 쿠팡 또는 네이버로 분류하지 못해 '기타'로 집계했습니다. 주문 원본의 채널명을 확인해 주세요.")
-                st.divider()
-                st.subheader("명절 주문 수요 · 명절 날짜에 맞춰 비교")
-                holiday=st.segmented_control('명절',options=['추석','설날'],default='추석',key='v20_holiday')
-                presets={'추석':(date(2026,9,25),date(2025,10,6)), '설날':(date(2026,2,17),date(2025,1,29))}
-                current_default,previous_default=presets[holiday]
-                p1,p2=st.columns(2)
-                with p1:
-                    event_current=st.date_input('비교 연도 명절 당일',value=current_default,key=f'v20_holiday_current_{holiday}')
-                with p2:
-                    event_previous=st.date_input('이전 연도 명절 당일',value=previous_default,key=f'v20_holiday_prev_{holiday}')
-                holidays=_v20_holiday(sales_v20,event_current,event_previous,today_v20)
-                st.dataframe(holidays,use_container_width=True,hide_index=True)
-                st.caption("각 명절 당일의 D-21~D-1을 7일씩 나눠 **주문 건수**로 비교합니다. 날짜를 직접 바꿀 수 있으며, 명절 당일·이후 주문과 배송 휴무일은 포함하지 않습니다.")
-                st.info("⚠️ 명절 분석의 '주문 건수'를 그대로 식혜 병 수량으로 환산하지 않습니다. 정확한 명절 생산량은 앞으로 누적될 실제 출고 기록과 함께 판단해야 합니다.")
+                _v20_big_chart(chart,330)
+                others=int((sales['channel']=='기타').sum()) if not sales.empty else 0
+                if others:
+                    st.warning(f"채널 분류 불명 주문 {others:,}건은 쿠팡/네이버 비교에서 제외했습니다.")
 
-        with st.expander("🤖 CRM AI 요약 (선택 실행)",expanded=False):
-            ai_ready=ai_status_line()
-            if st.button('✨ 현재 CRM 자동 분석',type='primary',key='dashboard_ai_run_v20',disabled=not ai_ready):
+                st.divider()
+                st.subheader("명절 주문 수요")
+                holiday=st.segmented_control('명절 종류',['추석','설날'],default='추석',key='v22_holiday_kind')
+                preset={'추석':(date(2026,9,25),date(2025,10,6)),
+                        '설날':(date(2026,2,17),date(2025,1,29))}
+                year_now,year_before=preset[holiday]
+                c1,c2=st.columns(2)
+                with c1:
+                    event_now=st.date_input('이번 비교 명절 당일',value=year_now,key=f'v22_event_now_{holiday}')
+                with c2:
+                    event_old=st.date_input('이전 비교 명절 당일',value=year_before,key=f'v22_event_old_{holiday}')
+                h=_v20_holiday(sales,event_now,event_old,today_v22)
+                st.dataframe(h,use_container_width=True,hide_index=True)
+                st.caption('명절 당일 기준 21~1일 전의 주문 건수를 비교합니다. 매년 명절 날짜가 바뀌므로 행사 날짜에 맞춰 분석하고 병 수와 구분합니다.')
+
+        with st.expander('🤖 CRM AI 요약 (선택 실행)', expanded=False):
+            ready=ai_status_line()
+            if st.button('✨ 현재 CRM 자동 분석',type='primary',key='dashboard_ai_run_v22',disabled=not ready):
                 with st.spinner('고객 개인정보를 제외한 집계 수치 분석 중...'):
-                    st.session_state['dashboard_ai_result_v20']=auto_ai_crm_analysis(customer_df,orders_db)
-            if st.session_state.get('dashboard_ai_result_v20'):
-                st.markdown(st.session_state['dashboard_ai_result_v20'])
+                    st.session_state['dashboard_ai_result_v22']=auto_ai_crm_analysis(customer_df,orders_db)
+            if st.session_state.get('dashboard_ai_result_v22'):
+                st.markdown(st.session_state['dashboard_ai_result_v22'])
 
 if tab_customers.open:
     with tab_customers:
@@ -2817,7 +3138,6 @@ if tab_download.open:
 
         vip = customer_df[customer_df["order_count"] >= 5].copy()
         repeat = customer_df[customer_df["order_count"] >= 2].copy()
-        churn_risk = customer_df[customer_df["days_since_last_order"] >= 90].copy()
         black_customers = customer_df[customer_df["black_status"].isin(["주의", "블랙"])].copy()
 
         summary = pd.DataFrame({
@@ -2830,7 +3150,6 @@ if tab_download.open:
             "고객CRM": customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]),
             "VIP": vip,
             "재구매": repeat,
-            "이탈위험": churn_risk,
             "블랙리스트": black_customers,
             "주문DB": orders_db.sort_values("order_date", ascending=False),
         }
