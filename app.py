@@ -3,6 +3,10 @@ import io
 import re
 from datetime import datetime, date
 
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+
+
 import pandas as pd
 import streamlit as st
 import requests
@@ -74,6 +78,41 @@ st.markdown("""
     margin: 12px 0;
 }
 
+
+/* V12 시각 정리: 기존 기능·위젯 구조는 유지 */
+:root { color-scheme: light; }
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    border-bottom: 1px solid #e5e7eb;
+}
+.stTabs [data-baseweb="tab"] {
+    white-space: nowrap;
+    border-radius: 10px 10px 0 0;
+    padding: 10px 12px;
+}
+.stTabs [aria-selected="true"] {
+    color: #b45309 !important;
+    background: #fff7ed !important;
+    font-weight: 700 !important;
+}
+[data-testid="stMetric"] {
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 12px 14px;
+    background-color: #ffffff;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="stNumberInput"]) {
+    border-color: #e5e7eb;
+}
+@media (max-width: 650px) {
+    .block-container {padding-top: 1rem; padding-left: .65rem; padding-right: .65rem;}
+    h1 {font-size: 1.7rem !important;}
+    h2 {font-size: 1.35rem !important;}
+    [data-testid="stMetric"] {padding: 8px;}
+    .stTabs [data-baseweb="tab"] {padding: 8px 10px;}
+}
 
 /* 모바일/다크모드 표 가독성 보정 */
 [data-testid="stDataFrame"] {
@@ -390,6 +429,7 @@ def make_customer_df(order_level):
     return customer
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_all(table_name):
     if sb is None:
         return pd.DataFrame()
@@ -467,6 +507,7 @@ def upsert_orders(order_level):
         chunk = records[i:i + chunk_size]
         saved_count += save_chunk_safely(chunk)
 
+    fetch_all.clear()
     return saved_count
 
 
@@ -506,12 +547,14 @@ def save_blacklist(row):
 
     row["updated_at"] = datetime.now().isoformat(timespec="seconds")
     sb.table("blacklist").upsert([row], on_conflict="customer_key").execute()
+    fetch_all.clear()
 
 
 def delete_blacklist(customer_key):
     if sb is None:
         return
     sb.table("blacklist").delete().eq("customer_key", customer_key).execute()
+    fetch_all.clear()
 
 
 
@@ -542,8 +585,10 @@ def save_customer_note(customer_key, customer_name, phone, address, memo):
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     sb.table("blacklist").upsert([row], on_conflict="customer_key").execute()
+    fetch_all.clear()
 
 
+@st.cache_data(ttl=300, max_entries=3, show_spinner=False)
 def to_excel_bytes(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -993,6 +1038,394 @@ def make_weekly_shipping_average(orders_db, weeks=8):
     return summary[["품목", "최근주간평균출고수량", "최근총출고수량", "분석주수"]].sort_values("최근주간평균출고수량", ascending=False)
 
 
+# 같은 파일을 다시 렌더링할 때 복호화/엑셀 분석을 반복하지 않습니다.
+@st.cache_data(ttl=900, max_entries=12, show_spinner=False)
+def parse_uploaded_file_cached(filename, content):
+    file_like = io.BytesIO(content)
+    if filename.lower().endswith(".csv"):
+        raw = pd.read_csv(file_like)
+    else:
+        raw = read_excel_file(file_like)
+    market = detect_market(filename, raw)
+    std = standardize(raw, market, filename)
+    return std, market, len(raw)
+
+
+# ===== 재고관리 통합 기능 (별도 모듈 필요 없음) =====
+# 품목 코드는 저장 후 이름이 바뀌더라도 유지되는 키로 사용한다.
+ITEMS = [
+    ("sikhye_1l", "식혜 1L", 150, False),
+    ("sikhye_500ml", "식혜 500ml", 100, True),
+    ("pumpkin_1l", "단호박식혜 1L", 60, False),
+    ("pumpkin_500ml", "단호박식혜 500ml", 30, False),
+    ("sikhye_200ml", "식혜 200ml", 100, False),
+]
+KST = ZoneInfo("Asia/Seoul")
+KEYS = [p[0] for p in ITEMS]
+LABELS = {p[0]: p[1] for p in ITEMS}
+
+
+def _safe_int(x):
+    try:
+        return max(0, int(x))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def _is_low(key, remaining):
+    limit, inclusive = next((p[2], p[3]) for p in ITEMS if p[0] == key)
+    return remaining <= limit if inclusive else remaining < limit
+
+
+def classify_label(label):
+    s = str(label).lower().replace(" ", "")
+    pumpkin = "단호박" in s or "호박" in s
+    if "200ml" in s:
+        return None if pumpkin else "sikhye_200ml"
+    if "500ml" in s:
+        return "pumpkin_500ml" if pumpkin else "sikhye_500ml"
+    if "1l" in s or "1000ml" in s:
+        return "pumpkin_1l" if pumpkin else "sikhye_1l"
+    return None
+
+
+def today_shipment(raw_orders, shipping_summary_func):
+    """기존 쿠팡/네이버 수량 파서를 재사용해 출고량을 정확히 가져온다."""
+    out = {key: 0 for key in KEYS}
+    unknown = []
+    if raw_orders is None or raw_orders.empty:
+        return out, unknown
+    shipping = shipping_summary_func(raw_orders)
+    for _, r in shipping.iterrows():
+        key = classify_label(r.get("품목", ""))
+        if key:
+            out[key] += _safe_int(r.get("실제출고수량"))
+        else:
+            unknown.append((str(r.get("품목", "기타")), _safe_int(r.get("실제출고수량"))))
+    return out, unknown
+
+
+def _get_db_client():
+    """공개용 publishable key로 재고를 수정할 수 없도록 별도의 서버 비밀키 사용."""
+    secret = st.secrets.get("INVENTORY_DB_KEY", "")
+    url = st.secrets.get("SUPABASE_URL", "")
+    if not secret or not url:
+        return None
+    if not (secret.startswith("sb_secret_") or secret.startswith("eyJ")):
+        return None
+    try:
+        from supabase import create_client
+        return create_client(url, secret)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _read_inventory_data(url, secret, nonce=0):
+    """캐시 키에는 비밀키가 포함되지만 UI에 출력하지 않는다."""
+    from supabase import create_client
+    client = create_client(url, secret)
+    rows = []
+    start = 0
+    while True:
+        result = client.table("inventory_daily").select("inventory_date,item_key,opening_qty,received_qty,auto_ship_qty,actual_ship_qty,closing_qty,note,updated_at").order("inventory_date", desc=True).range(start, start + 999).execute()
+        batch = result.data or []
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        start += 1000
+    return rows
+
+
+def fetch_inventory_rows():
+    secret = st.secrets.get("INVENTORY_DB_KEY", "")
+    url = st.secrets.get("SUPABASE_URL", "")
+    if not secret or not url:
+        return [], "DB 저장 준비 중: Streamlit Secrets에 INVENTORY_DB_KEY를 추가해주세요."
+    try:
+        return _read_inventory_data(url, secret), ""
+    except Exception as exc:
+        # DB 테이블 미생성, 네트워크 오류 등을 앱 전체 장애로 확대하지 않는다.
+        return [], f"재고 DB를 불러오지 못했습니다. inventory_schema.sql 적용 여부와 DB 연결을 확인하세요. ({type(exc).__name__})"
+
+
+def previous_inventory(rows, as_of):
+    prev = {}
+    for r in rows:
+        try:
+            d = date.fromisoformat(str(r["inventory_date"])[:10])
+            key = r["item_key"]
+            if d < as_of and key in KEYS and (key not in prev or d > prev[key][0]):
+                prev[key] = (d, _safe_int(r["closing_qty"]))
+        except (KeyError, ValueError, TypeError):
+            pass
+    return prev
+
+
+def existing_today(rows, as_of):
+    return {
+        str(r.get("item_key")): r
+        for r in rows if str(r.get("inventory_date"))[:10] == as_of.isoformat()
+    }
+
+
+def make_message(as_of, rows, compact=False):
+    header = f"📦 식혜명가 재고 현황 ({as_of:%m/%d})"
+    lines = [header, ""]
+    if not compact:
+        lines.append("[오늘 출고 / 남은 재고]")
+        lines.append("")
+    low = 0
+    for r in rows:
+        warning = _is_low(r["item_key"], r["closing_qty"])
+        low += int(warning)
+        name = LABELS[r["item_key"]]
+        if compact:
+            lines.append(f"{name}: {r['closing_qty']:,}개{' ⚠️' if warning else ''}")
+        else:
+            lines.append(f"{name}{' ⚠️' if warning else ''}")
+            lines.append(f"출고 {r['actual_ship_qty']:,}개 / 재고 {r['closing_qty']:,}개")
+            lines.append("")
+    if low:
+        lines.append(f"⚠️ 재고 부족 {low}품목")
+    return "\n".join(lines).strip()
+
+
+def snapshots_weekly(rows, weeks=12, as_of=None):
+    """날짜별 스냅샷을 동일 주·품목으로 합산. 기록한 날짜 수 함께 제공."""
+    if as_of is None:
+        as_of = datetime.now(KST).date()
+    current_week = as_of - timedelta(days=as_of.weekday())
+    start_week = current_week - timedelta(weeks=weeks - 1)
+    data = []
+    for r in rows:
+        try:
+            d = date.fromisoformat(str(r.get("inventory_date", ""))[:10])
+            if start_week <= d <= as_of and r.get("item_key") in KEYS:
+                start = d - timedelta(days=d.weekday())
+                data.append({"주": start.isoformat(), "품목": LABELS[r["item_key"]], "출고수량": _safe_int(r.get("actual_ship_qty")), "날짜": d.isoformat()})
+        except ValueError:
+            continue
+    if not data:
+        return pd.DataFrame(), pd.DataFrame()
+    df = pd.DataFrame(data)
+    weekly = df.groupby(["주", "품목"], as_index=False).agg(출고수량=("출고수량", "sum"), 기록일수=("날짜", "nunique"))
+    # 미기록일을 0개 출고로 간주하지 않는다. 주간 평균은 기록일수 7일인 주만 사용.
+    completed = weekly[weekly["기록일수"] >= 7]
+    avg = (completed.groupby("품목")["출고수량"].agg(["mean", "count"])
+           .reset_index().rename(columns={"mean": "완전한_주간_평균", "count": "분석주수"})) if not completed.empty else pd.DataFrame()
+    return weekly, avg
+
+
+def last_year_order_approx(orders_db, as_of, infer_fn):
+    """주문 DB에 품목별 원본행이 없어 명확한 1상품 주문만 제한적으로 추정."""
+    counts = {key: 0 for key in KEYS}
+    info = {"total": 0, "usable": 0}
+    if orders_db is None or orders_db.empty:
+        return counts, info
+    required = {"order_date", "raw_rows", "product_names", "total_quantity", "channel"}
+    if not required.issubset(orders_db.columns):
+        return counts, info
+    iso = as_of.isocalendar()
+    last_year_iso = iso.year - 1
+    dt = pd.to_datetime(orders_db["order_date"], utc=True, errors="coerce").dt.tz_convert("Asia/Seoul")
+    weeks = dt.dt.isocalendar()
+    selected = orders_db[(weeks["year"] == last_year_iso) & (weeks["week"] == iso.week)]
+    info["total"] = len(selected)
+    for _, r in selected.iterrows():
+        if _safe_int(r.get("raw_rows")) != 1:
+            continue
+        product = str(r.get("product_names", ""))
+        if not product or product.lower() == "nan":
+            continue
+        name, units = infer_fn(product, str(r.get("channel", "")))
+        key = classify_label(name)
+        if key and units >= 1:
+            counts[key] += _safe_int(r.get("total_quantity")) * _safe_int(units)
+            info["usable"] += 1
+    return counts, info
+
+
+def save_inventory(records, summary_note=""):
+    client = _get_db_client()
+    if client is None:
+        raise RuntimeError("재고 DB 비밀키를 설정해야 저장할 수 있습니다.")
+    # 재고 재저장 시 같은 날짜·품목 행은 업데이트된다. 이전 재고는 추가로 차감되지 않는다.
+    payload = []
+    for r in records:
+        payload.append({
+            "inventory_date": str(r["inventory_date"]),
+            "item_key": r["item_key"],
+            "opening_qty": _safe_int(r["opening_qty"]),
+            "received_qty": _safe_int(r["received_qty"]),
+            "auto_ship_qty": _safe_int(r["auto_ship_qty"]),
+            "actual_ship_qty": _safe_int(r["actual_ship_qty"]),
+            "closing_qty": _safe_int(r["closing_qty"]),
+            "note": str(summary_note)[:300],
+            "updated_at": datetime.now(KST).isoformat(),
+        })
+    client.table("inventory_daily").upsert(payload, on_conflict="inventory_date,item_key").execute()
+    _read_inventory_data.clear()
+    # audit는 스냅샷이 성공적으로 저장된 경우에만 추가한다.
+    try:
+        audit = [{"inventory_date": p["inventory_date"], "item_key": p["item_key"],
+                  "opening_qty": p["opening_qty"], "received_qty": p["received_qty"],
+                  "auto_ship_qty": p["auto_ship_qty"], "actual_ship_qty": p["actual_ship_qty"],
+                  "closing_qty": p["closing_qty"], "note": p["note"]} for p in payload]
+        client.table("inventory_audit").insert(audit).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _draft_key(as_of, key, field):
+    return f"inventory_{as_of.isoformat()}_{key}_{field}"
+
+
+def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shipping_item):
+    as_of = datetime.now(KST).date()
+    st.subheader("📦 재고관리")
+    st.caption("품목별 재고 확인 → 출고 수정 → 생산 입고 → 최종 확인 후 직접 저장")
+    history_rows, error = fetch_inventory_rows()
+    today_saved = existing_today(history_rows, as_of)
+    prev_saved = previous_inventory(history_rows, as_of)
+    auto, unknown = today_shipment(raw_orders, shipping_summary_func)
+
+    if error:
+        st.warning(error)
+    if raw_orders is None or raw_orders.empty:
+        st.info("오늘 엑셀을 업로드하지 않았습니다. 출고량은 0개로 표시되므로 수동으로 수정할 수 있습니다.")
+    if unknown:
+        st.warning("분류되지 않은 상품이 있습니다. 오늘 출고 총합의 기타 품목을 확인하세요: " + ", ".join(f"{a} {b}개" for a, b in unknown))
+
+    # 기존 재고의 다음날 이월, 저장된 당일 재고의 재편집을 구분한다.
+    rows = []
+    st.markdown("#### 오늘 품목별 재고")
+    st.caption("기준재고는 시작 시점의 재고입니다. 실제 출고는 엑셀 자동값을 바탕으로 수정할 수 있습니다.")
+    for key, label, threshold, inclusive in ITEMS:
+        saved = today_saved.get(key, {})
+        opening_default = _safe_int(saved["opening_qty"]) if saved else prev_saved.get(key, (None, 0))[1]
+        inbound_default = _safe_int(saved.get("received_qty", 0))
+        actual_default = _safe_int(saved.get("actual_ship_qty", auto[key]))
+
+        # 엑셀 출고량이 달라지면 사용자가 수동 보정했던 차이는 그대로 유지합니다.
+        actual_key = _draft_key(as_of, key, "actual")
+        auto_key = _draft_key(as_of, key, "last_auto")
+        if actual_key not in st.session_state:
+            st.session_state[actual_key] = actual_default
+            st.session_state[auto_key] = auto[key]
+        elif st.session_state.get(auto_key, auto[key]) != auto[key]:
+            delta = auto[key] - st.session_state[auto_key]
+            st.session_state[actual_key] = max(0, int(st.session_state[actual_key]) + delta)
+            st.session_state[auto_key] = auto[key]
+
+        with st.container(border=True):
+            col_title, col_auto = st.columns([3, 1.5], vertical_alignment="center")
+            col_title.markdown(f"**{label}**")
+            col_auto.caption(f"엑셀 출고 {auto[key]:,}개")
+            inputs = st.columns(3, gap="small")
+            opening = inputs[0].number_input("기준 재고", min_value=0, step=1,
+                value=opening_default, key=_draft_key(as_of, key, "opening"))
+            received = inputs[1].number_input("생산/입고", min_value=0, step=1,
+                value=inbound_default, key=_draft_key(as_of, key, "received"))
+            actual = inputs[2].number_input("실제 출고 (수정 가능)", min_value=0, step=1,
+                key=actual_key)
+            closing = int(opening) + int(received) - int(actual)
+            low = _is_low(key, closing)
+            status = "🔴 재고 부족" if low else "🟢 정상"
+            st.markdown(f"**출고 후 재고: {closing:,}개**　 |　 {status}　 |　 알림 기준 {threshold}개{' 이하' if inclusive else ' 미만'}")
+
+        rows.append({"inventory_date": as_of.isoformat(), "item_key": key,
+                     "opening_qty": int(opening), "received_qty": int(received),
+                     "auto_ship_qty": auto[key], "actual_ship_qty": int(actual),
+                     "closing_qty": closing})
+
+    st.caption("부족 기준: 식혜 1L 150개 미만 / 식혜 500ml 100개 이하 / 단호박 1L 60개 미만 / 단호박 500ml 30개 미만 / 식혜 200ml 100개 미만")
+    low_rows = [r for r in rows if _is_low(r["item_key"], r["closing_qty"])]
+    col_alert, col_excel, col_saved = st.columns(3)
+    col_alert.metric("재고 부족 품목", f"{len(low_rows)}종")
+    col_excel.metric("엑셀 인식 품목", f"{sum(1 for k in KEYS if auto[k] > 0)}종")
+    col_saved.metric("오늘 저장된 품목", f"{len(today_saved)}종")
+    if low_rows:
+        st.error("생산 확인 필요: " + ", ".join(LABELS[r["item_key"]] for r in low_rows))
+    if any(r["closing_qty"] < 0 for r in rows):
+        st.error("남은 재고가 음수인 품목이 있습니다. 기준 재고 또는 출고량을 확인하세요.")
+
+    note = st.text_input("재고 저장 메모 (선택)", key=_draft_key(as_of, "all", "note"), placeholder="예: 매장 출고 5개 반영 / 생산 200개 추가")
+    submitted = st.button("💾 최종 재고 DB 저장", type="primary", use_container_width=True, disabled=any(r["closing_qty"] < 0 for r in rows) or bool(error))
+    if submitted:
+        try:
+            audit_ok = save_inventory(rows, note)
+            st.success("재고 저장 완료. 같은 날짜에 다시 저장하면 해당 날짜의 최종 값을 수정합니다.")
+            if not audit_ok:
+                st.warning("현재고는 저장되었지만 변경 이력 저장에 실패했습니다. inventory_audit 테이블을 확인하세요.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"재고 저장에 실패했습니다. DB 설정을 확인해주세요. ({type(exc).__name__}: {str(exc)[:180]})")
+
+    st.divider()
+    st.markdown("#### 💬 카카오톡 복사")
+    st.caption("문자 간격이 깨지지 않도록 표 대신 줄바꿈 형식으로 만듭니다. 아래 메시지 오른쪽 위의 복사 아이콘을 누르세요.")
+    simple, detailed = st.tabs(["출고 + 남은 재고", "칠판용 남은 재고만"])
+    with simple:
+        st.code(make_message(as_of, rows, compact=False), language=None)
+    with detailed:
+        st.code(make_message(as_of, rows, compact=True), language=None)
+    st.caption("카톡용 메시지는 현재 화면의 수정값을 반영합니다. 저장한 뒤 복사하는 것을 권장합니다.")
+
+    st.divider()
+    st.markdown("#### 📈 주별 출고 비교와 생산 참고")
+    weeks = st.select_slider("주간 조회 기간", options=[4, 8, 12, 26, 52], value=12, format_func=lambda n: f"최근 {n}주")
+    weekly, avg = snapshots_weekly(history_rows, weeks=weeks, as_of=as_of)
+    if weekly.empty:
+        st.info("아직 품목별 날짜 재고 기록이 없습니다. 오늘부터 저장하면 정확한 주별 출고 기록이 쌓입니다.")
+    else:
+        pivot = weekly.pivot_table(index="주", columns="품목", values="출고수량", aggfunc="sum", fill_value=0)
+        st.bar_chart(pivot)
+        with st.expander("주별 출고량 세부 내역"):
+            st.dataframe(weekly, use_container_width=True, hide_index=True)
+        if avg.empty:
+            st.info("최근 기간에 7일 모두 기록된 주가 없어 신뢰할 만한 주간 평균을 계산하지 않았습니다.")
+        else:
+            st.markdown("**완전 기록된 주 기준 평균**")
+            st.dataframe(avg.round(1), use_container_width=True, hide_index=True)
+
+    # 작년 주간 데이터가 실주문 상세가 아닌 주문 단위로만 저장된 경우 추정임을 명시.
+    with st.expander("작년 같은 주 비교 (기존 주문 DB 기반 추정)"):
+        # 주문 건수는 기존 orders 테이블에서 정확히 세고, 품목별 병 수량은 제한적으로 추정합니다.
+        if orders_db is not None and not orders_db.empty and "order_date" in orders_db.columns:
+            dates = pd.to_datetime(orders_db["order_date"], utc=True, errors="coerce").dt.tz_convert("Asia/Seoul")
+            iso = dates.dt.isocalendar()
+            current_iso = as_of.isocalendar()
+            count_this = int(((iso["year"] == current_iso.year) & (iso["week"] == current_iso.week)).sum())
+            count_last = int(((iso["year"] == current_iso.year - 1) & (iso["week"] == current_iso.week)).sum())
+            metric_this, metric_last = st.columns(2)
+            metric_this.metric("올해 같은 주 주문 건수", f"{count_this:,}건")
+            metric_last.metric("작년 같은 주 주문 건수", f"{count_last:,}건")
+            st.caption("주문 건수는 저장된 주문번호 기준입니다. 출고 병 수량과는 다릅니다.")
+        historic, coverage = last_year_order_approx(orders_db, as_of, infer_shipping_item)
+        if coverage["total"] == 0:
+            st.info("작년 같은 주 저장 주문이 없습니다.")
+        elif coverage["usable"] == 0:
+            st.info("작년 같은 주 주문은 있으나 품목별 실제 출고를 추정할 수 없습니다.")
+        else:
+            st.warning(f"주의: 작년 같은 주 {coverage['total']:,}건 중 단일상품 주문 {coverage['usable']:,}건만 계산했습니다. 혼합 주문 등은 제외되어 실제 출고보다 적을 수 있습니다. 생산량 결정에 단독 사용하지 마세요.")
+            df = pd.DataFrame([{"품목": label, "작년 같은 주 확인 가능 수량(추정 최소치)": historic[k]} for k, label, _, _ in ITEMS])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with st.expander("재고 저장 이력 조회"):
+        if not history_rows:
+            st.info("저장된 재고 기록이 없습니다.")
+        else:
+            history = pd.DataFrame(history_rows)
+            history["품목"] = history["item_key"].map(LABELS)
+            desired = ["inventory_date", "품목", "opening_qty", "received_qty", "actual_ship_qty", "closing_qty", "updated_at"]
+            st.dataframe(history[[x for x in desired if x in history.columns]].rename(columns={
+                "inventory_date": "날짜", "opening_qty": "기준재고", "received_qty": "입고",
+                "actual_ship_qty": "실제출고", "closing_qty": "남은재고", "updated_at": "저장시각",
+            }), use_container_width=True, hide_index=True)
+
+
 # =========================
 # 앱 시작
 # =========================
@@ -1017,8 +1450,8 @@ with st.expander("사용법"):
 4. 블랙리스트 탭에서 고객별 주의/블랙 사유를 저장할 수 있습니다.
     """)
 
-tab_upload, tab_today, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_orders, tab_download = st.tabs([
-    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🤖 AI CRM 비서", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
+tab_upload, tab_today, tab_inventory, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_orders, tab_download = st.tabs([
+    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📦 재고관리", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🤖 AI CRM 비서", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
 ])
 
 if "today_order_preview" not in st.session_state:
@@ -1033,8 +1466,8 @@ if "today_detail_analysis" not in st.session_state:
 with tab_upload:
     st.markdown("""
     <div class="upload-guide">
-        <div class="upload-title">📂 쿠팡/네이버 엑셀을 여기에 끌어다 놓기</div>
-        <div class="upload-sub">파일 여러 개를 한 번에 드래그하거나, 아래 큰 버튼을 눌러 추가 업로드하세요.</div>
+        <div class="upload-title">📂 쿠팡/네이버 엑셀 업로드</div>
+        <div class="upload-sub">바로 아래 파일 업로드 박스에 끌어다 놓거나 클릭하세요.</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1053,14 +1486,12 @@ with tab_upload:
         progress = st.progress(0, text="엑셀 읽는 중...")
         for idx, f in enumerate(uploaded_files, start=1):
             try:
-                raw = pd.read_csv(f) if f.name.lower().endswith(".csv") else read_excel_file(f)
-                market = detect_market(f.name, raw)
-                std = standardize(raw, market, f.name)
+                std, market, raw_len = parse_uploaded_file_cached(f.name, f.getvalue())
                 frames.append(std)
                 read_logs.append({
                     "파일명": f.name,
                     "채널": market,
-                    "원본행": len(raw),
+                    "원본행": raw_len,
                     "정리행": len(std),
                     "상태": "성공",
                 })
@@ -1171,6 +1602,15 @@ customer_df["총주문금액"] = customer_df["total_amount"]
 customer_df["건당평균금액"] = customer_df["avg_order_amount"]
 
 
+with tab_inventory:
+    render_inventory(
+        raw_orders=st.session_state.get("today_raw_orders", pd.DataFrame()),
+        orders_db=orders_db,
+        shipping_summary_func=make_shipping_summary,
+        infer_shipping_item=infer_shipping_item,
+    )
+
+
 with tab_today:
     st.subheader("🔥 오늘 주문 분석")
     st.caption("엑셀 업로드 후 DB 저장 전에도 기존 DB와 비교해서 오늘 주문 고객이 신규인지 재구매인지 바로 확인합니다.")
@@ -1226,7 +1666,8 @@ with tab_today:
             else:
                 st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
 
-        with st.expander("저장 DB 기준 최근 N주 평균 출고량", expanded=False):
+        with st.expander("저장 DB 기준 최근 N주 평균 출고량 (기존 주문 단위 추정)", expanded=False):
+            st.warning("기존 주문 DB는 원본 상품행이 없어 혼합 주문의 실제 병 수량을 정확히 복원할 수 없습니다. 생산량 판단에는 새 재고관리 탭의 기록을 사용하세요.")
             avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
             weekly_avg_db = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
             if weekly_avg_db.empty:
