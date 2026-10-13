@@ -337,6 +337,84 @@ def read_excel_file(uploaded_file):
             raise RuntimeError(f"엑셀 읽기 실패: {first_error} / 암호해제 실패: {second_error}")
 
 
+
+def convert_naver_cj_excel(uploaded_bytes: bytes) -> tuple[bytes, int, int]:
+    """네이버의 암호화 발주발송 엑셀에서 1행 안내문만 안전하게 제거한다.
+
+    반환: (암호 없는 XLSX 바이트, 상품행 수, 열 수). DB나 서버 디스크에 저장하지 않는다.
+    """
+    import zipfile
+    from openpyxl import load_workbook
+
+    if not uploaded_bytes or len(uploaded_bytes) > 25 * 1024 * 1024:
+        raise ValueError("파일이 비어 있거나 25MB를 초과합니다.")
+
+    ole_magic = bytes.fromhex("D0CF11E0A1B11AE1")
+    if uploaded_bytes.startswith(ole_magic):
+        if msoffcrypto is None:
+            raise RuntimeError("암호화 엑셀 변환에 msoffcrypto-tool 라이브러리가 필요합니다. requirements.txt를 확인하세요.")
+        try:
+            encrypted = msoffcrypto.OfficeFile(io.BytesIO(uploaded_bytes))
+            encrypted.load_key(password=str(st.secrets.get("SMARTSTORE_PASSWORD", SMARTSTORE_PASSWORD)))
+            decrypted = io.BytesIO()
+            encrypted.decrypt(decrypted)
+            payload = decrypted.getvalue()
+        except Exception as exc:
+            raise ValueError("엑셀 암호를 풀 수 없습니다. 스마트스토어 파일 또는 비밀번호 설정을 확인하세요.") from exc
+    elif uploaded_bytes.startswith(b"PK"):
+        payload = uploaded_bytes
+    else:
+        raise ValueError("지원하지 않는 파일 형식입니다. 네이버에서 내려받은 .xlsx 파일을 넣어주세요.")
+
+    if not zipfile.is_zipfile(io.BytesIO(payload)):
+        raise ValueError("암호 해제 후 엑셀 형식을 확인할 수 없습니다.")
+
+    workbook = load_workbook(io.BytesIO(payload), data_only=False, keep_links=True)
+    try:
+        sheet = workbook.worksheets[0]
+        first = str(sheet.cell(1, 1).value or "")
+        second = [str(sheet.cell(2, i).value or "").strip() for i in range(1, 11)]
+        if second[:2] != ["상품주문번호", "주문번호"] or "배송방법" not in second or "송장번호" not in second:
+            if str(sheet.cell(1, 1).value or "").strip() == "상품주문번호":
+                raise ValueError("이미 안내문 1행이 제거된 파일입니다. 다시 변환할 필요가 없습니다.")
+            raise ValueError("파일의 2행이 네이버 발주·발송 양식이 아닙니다. 원본을 확인해 주세요.")
+        if "다운로드 받은 파일" not in first and "엑셀 일괄발송" not in first:
+            raise ValueError("첫 번째 행이 네이버 안내문인지 확인할 수 없어 삭제하지 않았습니다.")
+        if len(workbook.worksheets) > 1:
+            raise ValueError("시트가 여러 개라 자동 삭제하지 않았습니다. 파일을 확인해 주세요.")
+
+        # 1행의 병합 셀(A1:C1 등)을 먼저 해제하지 않으면 새 표 헤더가 합쳐질 수 있다.
+        for span in list(sheet.merged_cells.ranges):
+            if span.min_row == 1:
+                if span.max_row != 1:
+                    raise ValueError("첫 행과 데이터가 함께 병합되어 있어 자동 변환할 수 없습니다.")
+                sheet.unmerge_cells(str(span))
+
+        expected_header = tuple(sheet.cell(2, j).value for j in range(1, sheet.max_column + 1))
+        first_data = tuple(sheet.cell(3, j).value for j in range(1, sheet.max_column + 1)) if sheet.max_row > 2 else None
+        total_columns = sheet.max_column
+        original_rows = sheet.max_row
+        sheet.delete_rows(1, 1)
+        output = io.BytesIO()
+        workbook.save(output)
+        result = output.getvalue()
+    finally:
+        workbook.close()
+
+    # 저장된 파일까지 다시 열어 헤더와 첫 주문행을 비교한다.
+    verification = load_workbook(io.BytesIO(result), read_only=True, data_only=False)
+    try:
+        check = verification.worksheets[0]
+        if tuple(check.cell(1, j).value for j in range(1, total_columns + 1)) != expected_header:
+            raise RuntimeError("변환된 파일의 제목 행이 원본과 달라 저장을 취소했습니다.")
+        if first_data is not None and tuple(check.cell(2, j).value for j in range(1, total_columns + 1)) != first_data:
+            raise RuntimeError("변환된 파일의 주문 내용이 변경되어 저장을 취소했습니다.")
+        if check.max_row != original_rows - 1:
+            raise RuntimeError("변환된 파일의 행 수가 일치하지 않습니다.")
+    finally:
+        verification.close()
+    return result, max(0, original_rows - 2), total_columns
+
 def detect_market(filename, df):
     name = filename.lower()
     cols = set(map(str, df.columns))
@@ -2160,6 +2238,37 @@ if tab_upload.open:
                         st.rerun()
         elif not st.session_state.get("today_raw_orders", pd.DataFrame()).empty:
             st.info("✅ 이전 업로드 분석이 이번 로그인 세션에 남아 있어요. 오늘 주문 분석·재고관리 탭에서 계속 사용할 수 있습니다. 새 파일을 올리면 갱신됩니다.")
+
+# 첫 페이지 하단: 일반 주문 DB 업로드와 완전히 분리된 CJ 송장 엑셀 변환.
+# 파일 위젯은 항상 렌더링하되 복호화·변환은 이 탭을 보고 있을 때만 실행한다.
+with tab_upload:
+    st.divider()
+    st.markdown("### 🚚 네이버 CJ 송장 엑셀 변환")
+    st.caption("스마트스토어에서 받은 암호화 엑셀을 그대로 올리면 안내문 첫 행만 제거합니다. 주문 DB에는 저장되지 않습니다.")
+    cj_uploaded = st.file_uploader(
+        "CJ 등록용으로 변환할 네이버 발주·발송관리 엑셀",
+        type=["xlsx"],
+        accept_multiple_files=False,
+        key="cj_naver_oneclick_converter_v24_home",
+        help="네이버 '선택주문 발주발송관리' 파일을 그대로 올려주세요. 파일 비밀번호 1111은 자동 처리합니다.",
+    )
+    if tab_upload.open and cj_uploaded is not None:
+        try:
+            with st.spinner("파일 암호 해제 및 안내문 첫 행 확인 중..."):
+                cj_bytes, cj_nrows, cj_ncols = convert_naver_cj_excel(cj_uploaded.getvalue())
+            st.success(f"변환 준비 완료: 주문 {cj_nrows:,}행 · {cj_ncols:,}개 열 유지")
+            st.download_button(
+                "💾 CJ 송장용 엑셀 저장",
+                data=cj_bytes,
+                file_name=f"{cj_uploaded.name.rsplit('.', 1)[0]}_CJ용.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+                key="cj_download_clean_v24_home",
+            )
+            st.caption("저장 버튼을 누르면 변환된 엑셀이 PC에 다운로드됩니다. 원본 파일과 기존 주문·재고 DB는 변경하지 않습니다.")
+        except Exception as exc:
+            st.error(f"변환하지 않았습니다: {exc}")
 
 # 업로드 탭을 보고 있을 때는 다른 탭의 1만 건 이상 DB/차트 분석을 실행하지 않는다.
 # 파일을 올린 경우 신규·재구매 분석에 필요한 주문 DB만 위쪽에서 별도로 확인한다.
