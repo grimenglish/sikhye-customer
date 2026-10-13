@@ -415,6 +415,295 @@ def convert_naver_cj_excel(uploaded_bytes: bytes) -> tuple[bytes, int, int]:
         verification.close()
     return result, max(0, original_rows - 2), total_columns
 
+# =========================
+# V26: 네이버/CJ 변환 및 4개 파일 자동 매칭 (단일 app.py 내부 함수)
+# =========================
+def _ship_norm(value):
+    """고객 식별용 최소한의 표기 정규화. 이름/주소의 추측 매칭은 하지 않는다."""
+    import unicodedata
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).lower()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _ship_digits(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return re.sub(r"\D", "", str(value))
+
+
+def _ship_str(value):
+    return "" if value is None else str(value).strip()
+
+
+def _ship_identity(entry):
+    return (entry["name"], entry["phone"], entry["address"])
+
+
+def _ship_signature(entry):
+    return (entry["item"], entry["quantity"])
+
+
+def _ship_extract_records(sheet, header, role):
+    """필수 열 이름으로 추출해, 엑셀 열 순서가 바뀌어도 안전하게 처리한다."""
+    hd = {str(value or "").strip(): i for i, value in enumerate(header)}
+    if role == "naver_order":
+        columns = ("수취인명", "수취인연락처1", "통합배송지", "옵션정보", "수량", "송장번호")
+    elif role == "coupang_order":
+        columns = ("수취인이름", "수취인전화번호", "수취인 주소", "등록옵션명", "구매수(수량)", "운송장번호")
+    else:
+        columns = ("받는분성명", "받는분전화번호", "받는분주소(전체, 분할)", "내품명", "내품수량", "운송장번호")
+    missing = [name for name in columns if name not in hd]
+    if missing:
+        raise ValueError(f"양식에 필요한 열이 없습니다: {', '.join(missing)}")
+    indices = [hd[x] for x in columns]
+    result = []
+    for row_number, cells in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        values = [(cells[k] if k < len(cells) else None) for k in indices]
+        if all(x is None or str(x).strip() == "" for x in values):
+            continue
+        name, phone, address, item, quantity, tracking = values
+        row = {
+            "row": row_number,
+            "name": _ship_norm(name),
+            "phone": _ship_digits(phone),
+            "address": _ship_norm(address),
+            "item": _ship_norm(item),
+            "quantity": _ship_str(quantity),
+            "tracking": _ship_str(tracking),
+            "tracking_digits": _ship_digits(tracking),
+        }
+        # 잘못된 송장 결합보다 작업 중단이 안전함.
+        if not all([row["name"], row["phone"], row["address"], row["item"], row["quantity"]]):
+            raise ValueError(f"{role} 파일의 {row_number}행에 이름·전화·주소·옵션·수량 누락이 있습니다.")
+        if role == "cj" and (not (10 <= len(row["tracking_digits"]) <= 16)
+                             or re.fullmatch(r"[0-9\- ]+", row["tracking"]) is None):
+            raise ValueError(f"CJ 파일 {row_number}행의 송장번호가 올바르지 않습니다.")
+        if role != "cj" and row["tracking"]:
+            raise ValueError(f"주문 파일 {row_number}행에 이미 운송장번호가 있습니다. 중복 발송 여부를 먼저 확인하세요.")
+        result.append(row)
+    if not result:
+        raise ValueError("주문 또는 운송장 데이터 행이 없습니다.")
+    return result
+
+
+def _ship_decrypt_naver(data):
+    """네이버 암호화 파일을 먼저 읽는다. 1행 제거 여부는 복호화 후 헤더로 판단."""
+    if msoffcrypto is None:
+        raise RuntimeError("암호화 네이버 파일을 읽으려면 msoffcrypto-tool 라이브러리가 필요합니다.")
+    try:
+        crypt = msoffcrypto.OfficeFile(io.BytesIO(data))
+        crypt.load_key(password=str(st.secrets.get("SMARTSTORE_PASSWORD", SMARTSTORE_PASSWORD)))
+        output = io.BytesIO()
+        crypt.decrypt(output)
+        return output.getvalue()
+    except Exception as exc:
+        raise ValueError("네이버 엑셀 암호를 풀지 못했습니다. 비밀번호 1111 또는 파일을 확인해 주세요.") from exc
+
+
+def _ship_read_file(filename, data):
+    """4개 파일을 헤더로 판별. 암호화 네이버의 안내문 유무도 처리."""
+    import zipfile
+    from openpyxl import load_workbook
+    if not filename.lower().endswith(".xlsx"):
+        raise ValueError(f"{filename}: .xlsx 파일만 지원합니다.")
+    if not data or len(data) > 25 * 1024 * 1024:
+        raise ValueError(f"{filename}: 파일이 비었거나 25MB를 초과했습니다.")
+    if data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+        # 암호화 파일이 이미 1행 제거된 경우도 있다. 복호화 후 헤더를 검사한다.
+        data = _ship_decrypt_naver(data)
+    elif not data.startswith(b"PK"):
+        raise ValueError(f"{filename}: 올바른 엑셀(.xlsx) 파일이 아닙니다.")
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        if sum(x.file_size for x in z.infolist()) > 180 * 1024 * 1024:
+            raise ValueError(f"{filename}: 압축 해제 크기가 너무 큽니다.")
+    wb = load_workbook(io.BytesIO(data), read_only=False, data_only=False, keep_links=False)
+    try:
+        if len(wb.worksheets) != 1:
+            raise ValueError(f"{filename}: 시트가 여러 개라 자동 판별하지 않았습니다.")
+        sheet = wb.worksheets[0]
+        head1 = tuple(x.value for x in next(sheet.iter_rows(min_row=1, max_row=1)))
+        columns = {str(x or "").strip() for x in head1}
+        if {"상품주문번호", "송장번호", "수취인명"} <= columns:
+            role = "naver_order"
+        elif {"묶음배송번호", "운송장번호", "수취인이름"} <= columns:
+            role = "coupang_order"
+        elif {"운송장번호", "받는분성명", "받는분전화번호"} <= columns:
+            role = "cj"
+        elif len(head1) > 1:
+            # 암호를 이미 해제했지만 아직 첫 행이 남아 있는 네이버 파일
+            second = tuple(x.value for x in next(sheet.iter_rows(min_row=2, max_row=2)))
+            if {"상품주문번호", "송장번호", "수취인명"} <= {str(x or "").strip() for x in second}:
+                wb.close()
+                data, _, _ = convert_naver_cj_excel(data)
+                return _ship_read_file(filename, data)
+            raise ValueError(f"{filename}: 네이버·쿠팡·CJ 중 지원되는 양식이 아닙니다.")
+        else:
+            raise ValueError(f"{filename}: 지원되는 양식이 아닙니다.")
+        records = _ship_extract_records(sheet, head1, role)
+        return {"file": filename, "role": role, "data": data, "records": records,
+                "columns": len(head1), "tracking_column": list(head1).index("송장번호" if role == "naver_order" else "운송장번호") + 1}
+    finally:
+        wb.close()
+
+
+def _ship_assign_carrier_files(order_files, carrier_files):
+    """같은 형식의 CJ 파일 2개를 수취인 키의 겹침으로 플랫폼별로 구별."""
+    if len(carrier_files) != 2:
+        raise ValueError("CJ 송장번호 파일 2개가 필요합니다.")
+    kinds = ("naver_order", "coupang_order")
+    identity_sets = {role: {_ship_identity(r) for r in order_files[role]["records"]} for role in kinds}
+    scores = []
+    for cf in carrier_files:
+        scores.append({role: sum(_ship_identity(r) in identity_sets[role] for r in cf["records"]) for role in kinds})
+    forward = scores[0]["naver_order"] + scores[1]["coupang_order"]
+    reverse = scores[0]["coupang_order"] + scores[1]["naver_order"]
+    if forward == reverse or max(forward, reverse) == 0:
+        raise ValueError("CJ 파일의 네이버·쿠팡 구분이 불확실합니다. 올바른 송장번호 파일 2개인지 확인하세요.")
+    if forward > reverse:
+        selected = {"naver_order": carrier_files[0], "coupang_order": carrier_files[1]}
+    else:
+        selected = {"naver_order": carrier_files[1], "coupang_order": carrier_files[0]}
+    return selected
+
+
+def _ship_match_platform(order_file, cj_file):
+    """이름+전화+주소 정확히 일치. 복수 송장은 옵션+수량으로 추가 구분."""
+    from collections import defaultdict, Counter
+    order_groups, cj_groups = defaultdict(list), defaultdict(list)
+    for r in order_file["records"]:
+        order_groups[_ship_identity(r)].append(r)
+    for r in cj_file["records"]:
+        cj_groups[_ship_identity(r)].append(r)
+    issues, assignments = [], {}
+    track_to_recipient = {}
+    for identity, group in cj_groups.items():
+        for row in group:
+            tracking = row["tracking_digits"]
+            if tracking in track_to_recipient and track_to_recipient[tracking] != identity:
+                issues.append(f"CJ {row['row']}행: 다른 수취인에게 동일 송장번호가 사용됐습니다.")
+            track_to_recipient[tracking] = identity
+        if identity not in order_groups:
+            issues.append(f"CJ {group[0]['row']}행: 주문 엑셀에서 수취인 정보가 일치하지 않습니다.")
+
+    for identity, order_group in order_groups.items():
+        cj_group = cj_groups.get(identity, [])
+        if not cj_group:
+            issues.append(f"주문 {order_group[0]['row']}행: CJ 송장에 일치하는 수취인이 없습니다.")
+            continue
+        distinct_tracks = {r["tracking_digits"] for r in cj_group}
+        if len(order_group) != len(cj_group):
+            issues.append(f"주문 {order_group[0]['row']}행: 상품행 수가 CJ와 다릅니다 ({len(order_group)}행/{len(cj_group)}행).")
+            continue
+        order_sig = Counter(_ship_signature(x) for x in order_group)
+        cj_sig = Counter(_ship_signature(x) for x in cj_group)
+        if order_sig != cj_sig:
+            issues.append(f"주문 {order_group[0]['row']}행: CJ의 상품 옵션·수량과 일치하지 않습니다.")
+            continue
+        if len(distinct_tracks) == 1:
+            for r in order_group:
+                assignments[r["row"]] = cj_group[0]["tracking"]
+        else:
+            # 같은 수취인에 송장이 여러 개인 경우 옵션+수량으로만 연결
+            by_sig = defaultdict(list)
+            for r in cj_group:
+                by_sig[_ship_signature(r)].append(r)
+            for order in order_group:
+                options = by_sig[_ship_signature(order)]
+                if len(options) != 1:
+                    issues.append(f"주문 {order['row']}행: 동일 옵션에 여러 송장번호가 있어 자동 매칭할 수 없습니다.")
+                    continue
+                assignments[order["row"]] = options[0]["tracking"]
+    return assignments, issues
+
+
+def _ship_build_completed(order_file, assignments):
+    """기존 셀은 그대로 유지하고 송장번호 열만 변경한 뒤 재검증."""
+    from openpyxl import load_workbook
+    baseline = load_workbook(io.BytesIO(order_file["data"]), read_only=True, data_only=False)
+    try:
+        original_values = [tuple(row) for row in baseline.worksheets[0].values]
+    finally:
+        baseline.close()
+    if len(assignments) != len(order_file["records"]):
+        raise ValueError("송장 매칭되지 않은 주문행이 있어 완성 파일 생성을 중단했습니다.")
+    wb = load_workbook(io.BytesIO(order_file["data"]), keep_links=True)
+    try:
+        ws = wb.worksheets[0]
+        col = order_file["tracking_column"]
+        for row_number, tracking in assignments.items():
+            ws.cell(row_number, col).value = tracking  # 문자형으로 저장 (앞자리 0 보존)
+            ws.cell(row_number, col).number_format = "@"
+        output = io.BytesIO()
+        wb.save(output)
+        result = output.getvalue()
+    finally:
+        wb.close()
+    check = load_workbook(io.BytesIO(result), read_only=True, data_only=False)
+    try:
+        actual_values = [tuple(row) for row in check.worksheets[0].values]
+    finally:
+        check.close()
+    if len(original_values) != len(actual_values):
+        raise RuntimeError("완성 엑셀의 행 수가 원본과 달라졌습니다.")
+    for row_number, (original_row, completed_row) in enumerate(zip(original_values, actual_values), start=1):
+        if len(original_row) != len(completed_row):
+            raise RuntimeError(f"{row_number}행의 열 수가 변경됐습니다.")
+        for col_number, (before, after) in enumerate(zip(original_row, completed_row), start=1):
+            if row_number in assignments and col_number == order_file["tracking_column"]:
+                if _ship_digits(after) != _ship_digits(assignments[row_number]):
+                    raise RuntimeError(f"{row_number}행 송장번호 검증에 실패했습니다.")
+            elif before != after and not (before in (None, "") and after in (None, "")):
+                raise RuntimeError(f"원본의 송장번호 이외 값이 변경됐습니다 ({row_number}행).")
+    return result
+
+
+def make_shipment_zip(files, yyyymmdd):
+    """파일 순서 무관. 안전 매칭 성공 시 두 xlsx를 ZIP 하나로 반환."""
+    import zipfile
+    if len(files) != 4:
+        raise ValueError(f"파일 4개가 필요합니다. 현재 {len(files)}개입니다.")
+    if sum(len(b) for _, b in files) > 70 * 1024 * 1024:
+        raise ValueError("전체 업로드 용량이 70MB를 초과합니다.")
+    parsed = [_ship_read_file(name, data) for name, data in files]
+    order_files = {}
+    cj_files = []
+    for f in parsed:
+        if f["role"] == "cj":
+            cj_files.append(f)
+        elif f["role"] in order_files:
+            raise ValueError(f"같은 플랫폼의 주문 엑셀이 중복됐습니다: {f['role']}")
+        else:
+            order_files[f["role"]] = f
+    if set(order_files) != {"naver_order", "coupang_order"} or len(cj_files) != 2:
+        raise ValueError("네이버 주문 1개, 쿠팡 주문 1개, CJ 송장 2개를 넣어주세요.")
+    cj_map = _ship_assign_carrier_files(order_files, cj_files)
+    built, summary, issues = {}, {}, []
+    for platform, label in [("naver_order", "네이버"), ("coupang_order", "쿠팡")]:
+        order, cj = order_files[platform], cj_map[platform]
+        assignments, errs = _ship_match_platform(order, cj)
+        summary[label] = {"orders": len(order["records"]), "carriers": len(cj["records"]),
+                          "matched": len(assignments), "unique_tracks": len({x["tracking_digits"] for x in cj["records"]}),
+                          "order_file": order["file"], "cj_file": cj["file"]}
+        if errs:
+            issues.extend(f"{label}: {err}" for err in errs)
+        if len(assignments) != len(order["records"]):
+            issues.append(f"{label}: 매칭되지 않은 주문행이 있습니다.")
+        if not errs and len(assignments) == len(order["records"]):
+            built[label] = _ship_build_completed(order, assignments)
+    if issues:
+        return None, summary, issues
+    output = io.BytesIO()
+    names = {"네이버": f"★네이버 완성({yyyymmdd}).xlsx", "쿠팡": f"★쿠팡 완성({yyyymmdd}).xlsx"}
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for platform in ("네이버", "쿠팡"):
+            archive.writestr(names[platform], built[platform])
+    return output.getvalue(), summary, []
+
+
 def detect_market(filename, df):
     name = filename.lower()
     cols = set(map(str, df.columns))
@@ -2120,8 +2409,8 @@ with st.expander("사용법"):
 4. 블랙리스트 탭에서 고객별 주의/블랙 사유를 저장할 수 있습니다.
     """)
 
-tab_upload, tab_today, tab_inventory, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_orders, tab_download = st.tabs([
-    "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📦 재고관리", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🤖 AI CRM 비서", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
+tab_upload, tab_shipping, tab_today, tab_inventory, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_orders, tab_download = st.tabs([
+    "⬆️ 엑셀 업로드", "🚚 송장 업무", "🔥 오늘 주문 분석", "📦 재고관리", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🤖 AI CRM 비서", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
 ], on_change="rerun", key="crm_main_tabs")
 
 if "today_order_preview" not in st.session_state:
@@ -2239,40 +2528,98 @@ if tab_upload.open:
         elif not st.session_state.get("today_raw_orders", pd.DataFrame()).empty:
             st.info("✅ 이전 업로드 분석이 이번 로그인 세션에 남아 있어요. 오늘 주문 분석·재고관리 탭에서 계속 사용할 수 있습니다. 새 파일을 올리면 갱신됩니다.")
 
-# 첫 페이지 하단: 일반 주문 DB 업로드와 완전히 분리된 CJ 송장 엑셀 변환.
-# 파일 위젯은 항상 렌더링하되 복호화·변환은 이 탭을 보고 있을 때만 실행한다.
-with tab_upload:
-    st.divider()
-    st.markdown("### 🚚 네이버 CJ 송장 엑셀 변환")
-    st.caption("스마트스토어에서 받은 암호화 엑셀을 그대로 올리면 안내문 첫 행만 제거합니다. 주문 DB에는 저장되지 않습니다.")
+# 송장 업무는 일반 주문/고객/재고 DB와 완전히 별도. 파일은 저장하지 않고 브라우저 다운로드만 제공.
+# 위: 네이버 안내문 1행 제거 / 아래: 네이버+쿠팡+CJ 4개 파일 동시 매칭.
+with tab_shipping:
+    st.subheader("🚚 송장 업무 자동화")
+    st.caption("엑셀을 직접 수정하지 않고, 파일 업로드와 다운로드로 송장 업무를 끝냅니다. DB에는 저장되지 않습니다.")
+
+    st.markdown("### ① 네이버 엑셀 첫 줄 제거")
+    st.caption("CJ에 주문 엑셀을 등록하기 전, 스마트스토어 원본의 안내문 첫 행만 제거합니다. 파일 암호 1111 자동 처리.")
     cj_uploaded = st.file_uploader(
-        "CJ 등록용으로 변환할 네이버 발주·발송관리 엑셀",
+        "네이버 발주·발송관리 파일 1개 드래그",
         type=["xlsx"],
-        accept_multiple_files=False,
-        key="cj_naver_oneclick_converter_v24_home",
-        help="네이버 '선택주문 발주발송관리' 파일을 그대로 올려주세요. 파일 비밀번호 1111은 자동 처리합니다.",
+        key="ship_clean_naver_v26",
+        help="네이버 원본 엑셀만 넣어주세요. 이미 첫 행을 제거한 파일은 변환하지 않습니다.",
     )
-    if tab_upload.open and cj_uploaded is not None:
+    if tab_shipping.open and cj_uploaded is not None:
         try:
-            with st.spinner("파일 암호 해제 및 안내문 첫 행 확인 중..."):
-                cj_bytes, cj_nrows, cj_ncols = convert_naver_cj_excel(cj_uploaded.getvalue())
-            st.success(f"변환 준비 완료: 주문 {cj_nrows:,}행 · {cj_ncols:,}개 열 유지")
+            with st.spinner("암호 해제 · 안내문 1행 삭제 · 데이터 검증 중..."):
+                cleaned_bytes, clean_count, clean_cols = convert_naver_cj_excel(cj_uploaded.getvalue())
+            st.success(f"변환 완료: 주문 {clean_count:,}행 · {clean_cols:,}개 열 유지")
             st.download_button(
-                "💾 CJ 송장용 엑셀 저장",
-                data=cj_bytes,
+                "💾 네이버 1행 제거 파일 저장",
+                data=cleaned_bytes,
                 file_name=f"변완 네이버 송장 ({datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%d')}).xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True,
-                key="cj_download_clean_v24_home",
+                type="primary", use_container_width=True,
+                key="ship_clean_download_v26",
             )
-            st.caption("저장 버튼을 누르면 변환된 엑셀이 PC에 다운로드됩니다. 원본 파일과 기존 주문·재고 DB는 변경하지 않습니다.")
         except Exception as exc:
             st.error(f"변환하지 않았습니다: {exc}")
 
+    st.divider()
+    st.markdown("### ② 네이버 + 쿠팡 송장번호 자동 매칭")
+    st.caption("파일 4개를 **순서 상관없이 한 번에 드래그**하세요. 주문 2개 + CJ 송장 2개를 자동 구분합니다.")
+    st.info("📂 필요한 파일: 네이버 주문 1개 · 쿠팡 주문 1개 · 네이버 CJ 송장 1개 · 쿠팡 CJ 송장 1개")
+    joined_uploads = st.file_uploader(
+        "📥 주문 및 CJ 송장 엑셀 4개 동시 업로드",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="ship_four_files_v26",
+        help="네이버 파일 암호 1111 자동 해제. 송장번호와 수취인 주소·전화·상품·수량을 검증한 뒤 결합합니다.",
+    )
+    if tab_shipping.open and joined_uploads:
+        if len(joined_uploads) != 4:
+            st.warning(f"현재 {len(joined_uploads)}개 선택됨 · 주문 2개와 CJ 송장 2개, 총 4개를 넣어주세요.")
+        else:
+            try:
+                import hashlib
+                data_files = [(item.name, item.getvalue()) for item in joined_uploads]
+                signature = (datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d"),
+                             tuple(sorted((name, hashlib.sha256(blob).hexdigest()) for name, blob in data_files)))
+                if st.session_state.get("_ship_v26_signature") != signature:
+                    with st.spinner("파일 자동 판별 → 이름·연락처·주소·상품·수량 확인 → 송장번호 입력 → 최종 엑셀 재검사 중..."):
+                        datecode = datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%d')
+                        zip_bytes, summary, problems = make_shipment_zip(data_files, datecode)
+                    st.session_state["_ship_v26_signature"] = signature
+                    st.session_state["_ship_v26_result"] = (zip_bytes, summary, problems, datecode)
+                else:
+                    zip_bytes, summary, problems, datecode = st.session_state["_ship_v26_result"]
+
+                for platform in ("네이버", "쿠팡"):
+                    stats = summary[platform]
+                    st.markdown(
+                        f"**{platform}**: 주문 **{stats['orders']:,}행** · CJ 송장 **{stats['carriers']:,}행** "
+                        f"· 매칭 **{stats['matched']:,}행** · 실제 송장번호 **{stats['unique_tracks']:,}개**"
+                    )
+                if problems:
+                    st.error("🚨 일치하지 않는 행이 있어 최종 파일 생성을 중단했습니다. 파일 4개를 확인해 주세요.")
+                    with st.expander("어느 행을 확인해야 하나요?", expanded=True):
+                        for problem in problems[:35]:
+                            st.write("- " + problem)
+                        if len(problems) > 35:
+                            st.caption(f"그 외 {len(problems)-35:,}건은 파일 재확인이 필요합니다.")
+                else:
+                    st.success("✅ 두 플랫폼 전부 검증 완료. 원본의 송장번호 칸만 채웠습니다.")
+                    st.download_button(
+                        "📦 ★네이버 + ★쿠팡 완성 파일 2개 한 번에 저장",
+                        data=zip_bytes,
+                        file_name=f"송장완성_네이버+쿠팡_{datecode}.zip",
+                        mime="application/zip",
+                        type="primary", use_container_width=True,
+                        key="ship_zip_download_v26",
+                    )
+                    st.caption(f"한 번 클릭하면 ZIP이 다운로드됩니다. 압축을 풀면 **★네이버 완성({datecode}).xlsx**, **★쿠팡 완성({datecode}).xlsx** 두 파일이 나옵니다.")
+            except Exception as exc:
+                st.session_state.pop("_ship_v26_signature", None)
+                st.session_state.pop("_ship_v26_result", None)
+                st.error(f"송장 매칭을 중단했습니다: {exc}")
+                st.caption("잘못된 송장번호를 넣지 않기 위해 확인되지 않은 파일은 다운로드하지 않습니다.")
+
 # 업로드 탭을 보고 있을 때는 다른 탭의 1만 건 이상 DB/차트 분석을 실행하지 않는다.
 # 파일을 올린 경우 신규·재구매 분석에 필요한 주문 DB만 위쪽에서 별도로 확인한다.
-if tab_upload.open:
+if tab_upload.open or tab_shipping.open:
     st.stop()
 
 # DB 데이터 로드: 재고관리는 실제 출고 스냅샷만 필요하므로 주문 1만여 건 전체 조회 생략.
