@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 import requests
+import altair as alt
 
 try:
     import msoffcrypto
@@ -850,65 +851,114 @@ def auto_ai_crm_analysis(customer_df, orders_db):
     return ask_ai_crm(question, customer_df, orders_db)
 
 
-def ask_ai_crm(question, customer_df, orders_db):
-    """OpenAI 또는 Gemini 선택 사용. 키가 없으면 안내."""
-    context = make_ai_context(customer_df, orders_db)
+def _ai_settings():
+    """AI 설정 진단. 키는 UI/로그에 절대 표시하지 않음."""
+    preferred = str(st.secrets.get("AI_PROVIDER", "")).strip().lower()
+    gemini_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    openai_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
 
-    system_prompt = """
-너는 식혜 온라인 판매자의 CRM 분석 비서다.
-답변은 한국어로, 짧고 실무적으로 한다.
-고객명, 전화번호, 주소 등 개인정보를 절대 출력하지 않는다.
-개별 고객 식별이 아니라 집계/전략/마케팅 액션 중심으로 답한다.
-정확한 숫자는 제공된 CRM 요약 안에서만 사용한다.
-"""
+    # 과거 버전은 AI_PROVIDER를 생략하면 OpenAI로 고정돼 Gemini 키가 무시됐음.
+    if preferred not in ("gemini", "openai"):
+        preferred = "gemini" if gemini_key else "openai"
+    if preferred == "openai" and not openai_key and gemini_key:
+        preferred = "gemini"
+    if preferred == "gemini" and not gemini_key and openai_key:
+        preferred = "openai"
 
-    provider = st.secrets.get("AI_PROVIDER", "openai").lower()
-
-    if provider == "gemini":
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
-        model = st.secrets.get("GEMINI_MODEL", "gemini-2.0-flash")
-        if not api_key:
-            return "GEMINI_API_KEY가 Secrets에 없습니다."
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        payload = {
-            "contents": [{
-                "parts": [{
-                    "text": system_prompt + "\\n\\n" + context + "\\n\\n사용자 질문: " + question
-                }]
-            }]
+    if preferred == "gemini":
+        configured_model = str(st.secrets.get("GEMINI_MODEL", "")).strip()
+        retired = {
+            "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash",
+            "gemini-2.0-flash-001", "gemini-2.0-flash-lite",
+            "gemini-2.0-flash-lite-001", "gemini-1.5-flash-002",
         }
-        res = requests.post(url, json=payload, timeout=60)
-        if res.status_code >= 400:
-            return f"Gemini API 오류: {res.status_code} / {res.text[:500]}"
-        data = res.json()
-        try:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            return str(data)
+        # 2026-10 현행 안정 모델. 기존 중단 모델 설정은 자동 대체.
+        model = "gemini-3.5-flash-lite" if not configured_model or configured_model in retired else configured_model
+        switched = configured_model in retired
+        return {"provider": "gemini", "key": gemini_key, "model": model,
+                "ready": bool(gemini_key), "switched": switched}
 
+    return {"provider": "openai", "key": openai_key,
+            "model": str(st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini",
+            "ready": bool(openai_key), "switched": False}
+
+
+def _safe_ai_error(response, provider):
+    """서비스의 원본 오류 본문에는 계정정보가 있을 수 있으므로 그대로 출력하지 않음."""
+    status = response.status_code
+    if status in (401, 403):
+        detail = "API 키가 유효한지, 해당 모델을 사용할 권한이 있는지 확인해 주세요."
+    elif status == 404:
+        detail = "모델을 찾을 수 없습니다. Streamlit Secrets의 모델명을 확인해 주세요."
+    elif status == 429:
+        detail = "API 요청 한도 또는 사용량 제한에 걸렸습니다. 사용량/결제 설정을 확인해 주세요."
+    elif status == 400:
+        detail = "요청 또는 모델 설정이 맞지 않습니다. 모델명을 확인해 주세요."
+    elif status >= 500:
+        detail = "AI 서비스 쪽 서버 문제가 발생했습니다. 잠시 후 재시도해 주세요."
     else:
-        api_key = st.secrets.get("OPENAI_API_KEY", "")
-        model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
-        if not api_key:
-            return "OPENAI_API_KEY가 Secrets에 없습니다. Gemini를 쓰려면 AI_PROVIDER='gemini'와 GEMINI_API_KEY를 넣으세요."
+        detail = "호출에 실패했습니다. API 설정과 네트워크 상태를 확인해 주세요."
+    return f"⚠️ {provider} API 오류 (HTTP {status}): {detail}"
+
+
+def ask_ai_crm(question, customer_df, orders_db):
+    """Gemini/OpenAI 집계 기반 분석. 키 선택, 예외 처리, 결과 상태를 명확하게 함."""
+    config = _ai_settings()
+    if not config["ready"]:
+        return "⚠️ AI 연결 키가 없습니다. Streamlit Secrets에 GEMINI_API_KEY 또는 OPENAI_API_KEY를 설정해 주세요."
+
+    context = make_ai_context(customer_df, orders_db)
+    system_prompt = (
+        "너는 식혜 온라인 판매자의 CRM 분석 비서다. 한국어로 짧고 실무적으로 답하라. "
+        "고객 이름, 전화번호, 주소 등 개인정보는 출력하지 말고, "
+        "제공된 집계 수치만 활용하며 근거 없는 정밀 예측을 하지 마라."
+    )
+    try:
+        if config["provider"] == "gemini":
+            # 키를 URL 쿼리 파라미터에 넣지 않고 헤더로 전송 (로그 유출 최소화)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{config['model']}:generateContent"
+            headers = {"x-goog-api-key": config["key"], "Content-Type": "application/json"}
+            payload = {"contents": [{"parts": [{"text": system_prompt + "\n\n" + context + "\n\n사용자 질문: " + question}]}]}
+            res = requests.post(url, headers=headers, json=payload, timeout=55)
+            if res.status_code >= 400:
+                return _safe_ai_error(res, "Gemini")
+            data = res.json()
+            chunks = [p.get("text", "") for c in data.get("candidates", [])
+                      for p in c.get("content", {}).get("parts", []) if isinstance(p, dict)]
+            answer = "\n".join(chunks).strip()
+            if answer:
+                return answer
+            return "⚠️ Gemini가 텍스트를 반환하지 않았습니다. 다시 실행하거나 모델 설정을 확인해 주세요."
 
         url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": context + "\\n\\n질문: " + question},
-            ],
-            "temperature": 0.3,
-        }
-        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        headers = {"Authorization": f"Bearer {config['key']}", "Content-Type": "application/json"}
+        payload = {"model": config["model"], "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context + "\n\n질문: " + question}
+        ]}
+        res = requests.post(url, headers=headers, json=payload, timeout=55)
         if res.status_code >= 400:
-            return f"OpenAI API 오류: {res.status_code} / {res.text[:500]}"
+            return _safe_ai_error(res, "OpenAI")
         data = res.json()
-        return data["choices"][0]["message"]["content"]
+        return data.get("choices", [{}])[0].get("message", {}).get("content") or "⚠️ AI 응답이 비어 있습니다."
+    except requests.exceptions.Timeout:
+        return "⚠️ AI 서버 응답 시간이 초과됐습니다. 잠시 후 다시 실행해 주세요."
+    except requests.exceptions.RequestException:
+        return "⚠️ AI 서버에 연결하지 못했습니다. 네트워크 또는 서비스 상태를 확인해 주세요."
+    except (ValueError, KeyError, TypeError, IndexError):
+        return "⚠️ AI 응답을 읽는 중 문제가 생겼습니다. 모델 설정을 확인해 주세요."
 
+
+def ai_status_line():
+    config = _ai_settings()
+    if not config["ready"]:
+        st.warning("AI API 키가 없습니다. Streamlit Secrets에 GEMINI_API_KEY 또는 OPENAI_API_KEY가 필요합니다.")
+        return False
+    provider_label = "Gemini" if config["provider"] == "gemini" else "OpenAI"
+    st.caption(f"연결 설정: {provider_label} · {config['model']} · API 키 등록됨 (실제 호출 성공 여부는 분석 실행 시 확인)")
+    if config["switched"]:
+        st.info("기존 GEMINI_MODEL에 종료된 모델이 설정돼 있어 지원되는 기본 모델로 자동 전환했습니다.")
+    return True
 
 
 
@@ -1170,26 +1220,33 @@ def existing_today(rows, as_of):
     }
 
 
+# 카카오톡에서 글꼴 폭이 달라도 보기 좋도록 공백 정렬 대신 한 줄씩 구성.
+# 칠판에 옮겨 적기 쉽도록 단위 '개', 긴 품목명, 요약 경고를 제외한다.
+COPY_NAMES = {
+    "sikhye_1l": "1L",
+    "sikhye_500ml": "500ML",
+    "sikhye_200ml": "200ML",
+    "pumpkin_1l": "단호박 1L",
+    "pumpkin_500ml": "단호박 500ML",
+}
+
+
 def make_message(as_of, rows, compact=False):
-    header = f"📦 식혜명가 재고 현황 ({as_of:%m/%d})"
+    header = f"📦 재고 ({as_of:%m/%d})" if compact else f"📦 출고 / 재고 ({as_of:%m/%d})"
     lines = [header, ""]
-    if not compact:
-        lines.append("[오늘 출고 / 남은 재고]")
-        lines.append("")
-    low = 0
-    for r in rows:
-        warning = _is_low(r["item_key"], r["closing_qty"])
-        low += int(warning)
-        name = LABELS[r["item_key"]]
+    # 저장된 records에 같은 품목이 없으면 생략하고, 품목 순서는 고정한다.
+    by_key = {r["item_key"]: r for r in rows}
+    for key in KEYS:
+        r = by_key.get(key)
+        if r is None:
+            continue
+        name = COPY_NAMES[key]
+        warning = "   ⚠️" if _is_low(key, r["closing_qty"]) else ""
         if compact:
-            lines.append(f"{name}: {r['closing_qty']:,}개{' ⚠️' if warning else ''}")
+            lines.append(f"{name}: {r['closing_qty']:,}{warning}")
         else:
-            lines.append(f"{name}{' ⚠️' if warning else ''}")
-            lines.append(f"출고 {r['actual_ship_qty']:,}개 / 재고 {r['closing_qty']:,}개")
-            lines.append("")
-    if low:
-        lines.append(f"⚠️ 재고 부족 {low}품목")
-    return "\n".join(lines).strip()
+            lines.append(f"{name}: 출고 {r['actual_ship_qty']:,} / 재고 {r['closing_qty']:,}{warning}")
+    return "\n".join(lines)
 
 
 def render_oneclick_copy_button(message, label, button_id, accent=False):
@@ -2029,45 +2086,105 @@ with tab_today:
 
 
 with tab_dashboard:
+    st.subheader("📊 고객·주문 대시보드")
+    st.caption("저장된 CRM 데이터 기준 · 고객의 구매횟수는 누적 주문횟수로 계산")
+
     total_orders = len(orders_db)
     total_customers = len(customer_df)
     repeat_customers = int((customer_df["order_count"] >= 2).sum())
     repeat_rate = repeat_customers / total_customers * 100 if total_customers else 0
+    one_time_customers = int((customer_df["order_count"] == 1).sum())
     vip_count = int((customer_df["order_count"] >= 5).sum())
     black_count = int((customer_df["black_status"].isin(["주의", "블랙"])).sum())
 
-    cols = st.columns(6)
-    for col, (title, val) in zip(cols, [
-        ("누적 주문", f"{total_orders:,}건"),
-        ("누적 고객", f"{total_customers:,}명"),
-        ("재구매 고객", f"{repeat_customers:,}명"),
-        ("재구매율", f"{repeat_rate:.1f}%"),
-        ("VIP", f"{vip_count:,}명"),
-        ("주의/블랙", f"{black_count:,}명"),
-    ]):
-        with col:
-            st.markdown(f'<div class="kpi-card"><div class="kpi-title">{title}</div><div class="kpi-value">{val}</div></div>', unsafe_allow_html=True)
+    # 큰 카드 여섯 개를 3개씩 두 줄에 배치해 좁은 화면에서도 수치가 명확하게 읽히도록.
+    k1, k2, k3 = st.columns(3)
+    k1.metric("누적 주문", f"{total_orders:,}건")
+    k2.metric("누적 고객", f"{total_customers:,}명")
+    k3.metric("재구매율", f"{repeat_rate:.1f}%")
+    k4, k5, k6 = st.columns(3)
+    k4.metric("1회 구매 고객", f"{one_time_customers:,}명")
+    k5.metric("재구매 고객 (2회 이상)", f"{repeat_customers:,}명")
+    k6.metric("VIP (5회 이상)", f"{vip_count:,}명")
+    if black_count:
+        st.caption(f"⚠️ 주의/블랙 지정 고객: {black_count:,}명 · 자세한 내용은 블랙리스트 탭에서 확인")
 
-    st.write("")
-    with st.expander("🤖 AI 자동 분석 바로 실행", expanded=False):
-        st.caption("AI API Key가 연결되어 있으면 현재 CRM 상태를 자동 분석합니다.")
-        if st.button("대시보드에서 AI 분석 실행"):
-            with st.spinner("AI 분석 중..."):
-                st.markdown(auto_ai_crm_analysis(customer_df, orders_db))
+    st.divider()
+    st.markdown("#### 📈 월별 주문 흐름")
+    selected_months = st.segmented_control(
+        "표시 기간", options=["최근 12개월", "최근 24개월", "전체"],
+        default="최근 12개월", key="dashboard_month_window",
+    )
+    monthly = orders_db[["order_date"]].copy()
+    monthly["order_date"] = pd.to_datetime(monthly["order_date"], errors="coerce", utc=True)
+    monthly = monthly.dropna(subset=["order_date"])
+    monthly["month"] = monthly["order_date"].dt.strftime("%Y-%m")
+    counts = monthly.groupby("month").size().rename("orders").reset_index().sort_values("month")
+    if not counts.empty:
+        # 데이터가 없는 중간 월도 0건으로 표시해 흐름 왜곡 방지
+        month_period = pd.period_range(counts["month"].iloc[0], counts["month"].iloc[-1], freq="M")
+        counts = (pd.DataFrame({"month": month_period.astype(str)})
+                  .merge(counts, on="month", how="left").fillna({"orders": 0}))
+        counts["orders"] = counts["orders"].astype(int)
+        if selected_months != "전체":
+            n = 12 if selected_months == "최근 12개월" else 24
+            counts = counts.tail(n)
+        counts["3개월 평균"] = counts["orders"].rolling(3, min_periods=1).mean().round(1)
+        latest_orders = int(counts["orders"].iloc[-1])
+        # 사용자 스크린샷의 현재 달은 아직 진행 중이므로 수치를 확정 비교하지 않음
+        st.caption(f"조회 기간: {counts['month'].iloc[0]} ~ {counts['month'].iloc[-1]} · 마지막 달 {latest_orders:,}건 (진행 중인 월일 수 있음)")
+        bars = alt.Chart(counts).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+            x=alt.X("month:N", sort=list(counts["month"]), title=None,
+                    axis=alt.Axis(labelAngle=-40, labelOverlap=False, labelFontSize=11)),
+            y=alt.Y("orders:Q", title="주문 건수", axis=alt.Axis(tickMinStep=1)),
+            tooltip=[alt.Tooltip("month:N", title="월"), alt.Tooltip("orders:Q", title="주문", format=",d"),
+                     alt.Tooltip("3개월 평균:Q", title="3개월 이동평균", format=".1f")],
+            color=alt.value("#2563eb"),
+        )
+        st.altair_chart(bars.properties(height=265), use_container_width=True)
+    else:
+        st.info("월별 주문 날짜를 확인할 수 없습니다.")
 
-    st.write("")
-    left, right = st.columns(2)
-
+    st.divider()
+    left, right = st.columns([1.6, 1], gap="large")
     with left:
-        st.subheader("월별 누적 주문")
-        monthly = orders_db.copy()
-        monthly["월"] = pd.to_datetime(monthly["order_date"]).dt.to_period("M").astype(str)
-        st.bar_chart(monthly.groupby("월").size())
-
+        st.markdown("#### 👥 구매횟수별 고객")
+        st.caption("가로 막대로 표시해 '1회' 등의 글자가 잘리지 않도록 개선")
+        cats = ["1회", "2회", "3회", "4회", "5회 이상"]
+        oc = pd.to_numeric(customer_df["order_count"], errors="coerce").fillna(0)
+        bucket_df = pd.DataFrame({"구매횟수": cats, "고객수": [
+            int((oc == 1).sum()), int((oc == 2).sum()), int((oc == 3).sum()),
+            int((oc == 4).sum()), int((oc >= 5).sum()),
+        ]})
+        max_customers = max(1, int(bucket_df["고객수"].max()))
+        chart = alt.Chart(bucket_df).mark_bar(cornerRadiusEnd=4, size=24).encode(
+            y=alt.Y("구매횟수:N", sort=cats, title=None,
+                    axis=alt.Axis(labelAngle=0, labelFontSize=13, labelPadding=10)),
+            x=alt.X("고객수:Q", title="고객 수", scale=alt.Scale(domain=[0, max_customers * 1.22]),
+                    axis=alt.Axis(format=",d", tickCount=4)),
+            color=alt.condition(alt.datum["구매횟수"] == "1회", alt.value("#f59e0b"), alt.value("#2563eb")),
+            tooltip=[alt.Tooltip("구매횟수:N"), alt.Tooltip("고객수:Q", format=",d")],
+        )
+        labels = alt.Chart(bucket_df).mark_text(align="left", baseline="middle", dx=8, fontSize=13, fontWeight="bold").encode(
+            y=alt.Y("구매횟수:N", sort=cats), x="고객수:Q", text=alt.Text("고객수:Q", format=",d"))
+        st.altair_chart((chart + labels).properties(height=240), use_container_width=True)
     with right:
-        st.subheader("구매횟수별 고객")
-        bucket = customer_df["order_count"].apply(lambda x: "1회" if x == 1 else "2회" if x == 2 else "3회" if x == 3 else "4회 이상")
-        st.bar_chart(bucket.value_counts().reindex(["1회", "2회", "3회", "4회 이상"]).fillna(0))
+        st.markdown("#### 🔍 고객 구조 한눈에")
+        first_rate = 100 - repeat_rate if total_customers else 0
+        st.metric("1회 구매 비중", f"{first_rate:.1f}%")
+        st.progress(min(1.0, max(0.0, first_rate / 100)))
+        st.caption("재구매 유도 대상 고객의 규모를 파악할 수 있어요.")
+        st.metric("VIP 비중", f"{vip_count / total_customers * 100:.1f}%" if total_customers else "0.0%")
+        st.caption("VIP = 누적 5회 이상 구매 고객")
+
+    st.divider()
+    st.markdown("#### 🤖 CRM AI 분석")
+    ai_ready = ai_status_line()
+    if st.button("✨ 현재 CRM 자동 분석", type="primary", key="dashboard_ai_run_v19", disabled=not ai_ready):
+        with st.spinner("집계 데이터를 바탕으로 분석 중..."):
+            st.session_state["dashboard_ai_result_v19"] = auto_ai_crm_analysis(customer_df, orders_db)
+    if st.session_state.get("dashboard_ai_result_v19"):
+        st.markdown(st.session_state["dashboard_ai_result_v19"])
 
 with tab_customers:
     st.subheader("👤 고객 CRM")
@@ -2233,55 +2350,39 @@ with tab_vip:
 
 with tab_ai:
     st.subheader("🤖 AI CRM 비서")
-    st.caption("CRM 데이터를 요약해서 AI에게 질문합니다. OpenAI 또는 Gemini API Key를 Streamlit Secrets에 넣으면 작동합니다.")
-
-    st.markdown("""
-    **Secrets 예시**
-    ```toml
-    AI_PROVIDER = "openai"
-    OPENAI_API_KEY = "sk-..."
-    OPENAI_MODEL = "gpt-4o-mini"
-    ```
-    또는
-    ```toml
-    AI_PROVIDER = "gemini"
-    GEMINI_API_KEY = "..."
-    GEMINI_MODEL = "gemini-1.5-flash"
-    ```
-    """)
+    st.caption("고객 개인정보는 보내지 않고 누적 주문·재구매율·구매횟수 등 집계만 전송합니다.")
+    ai_ready = ai_status_line()
+    if not ai_ready:
+        st.code('AI_PROVIDER = "gemini"\nGEMINI_API_KEY = "실제 API 키"\nGEMINI_MODEL = "gemini-3.5-flash-lite"', language="toml")
+        st.caption("설정 경로: Streamlit Cloud → 앱 → Settings → Secrets · 비밀키는 채팅에 보내지 마세요.")
 
     st.markdown("### 🚀 자동 CRM 분석")
-    st.caption("현재 저장된 CRM 데이터를 AI가 자동으로 요약하고, 이번 주 실행할 액션까지 제안합니다.")
-
-    if st.button("자동 CRM 분석 실행", type="primary", use_container_width=True):
-        with st.spinner("AI가 전체 CRM을 자동 분석 중입니다..."):
-            answer = auto_ai_crm_analysis(customer_df, orders_db)
-        st.markdown(answer)
+    if st.button("✨ 자동 CRM 분석 실행", type="primary", use_container_width=True,
+                 key="ai_tab_auto_v19", disabled=not ai_ready):
+        with st.spinner("집계 데이터를 분석 중입니다..."):
+            st.session_state["ai_tab_auto_result_v19"] = auto_ai_crm_analysis(customer_df, orders_db)
+    if st.session_state.get("ai_tab_auto_result_v19"):
+        st.markdown(st.session_state["ai_tab_auto_result_v19"])
 
     st.divider()
-
     st.markdown("### 💬 직접 질문")
-    quick_q = st.selectbox(
-        "빠른 질문",
-        [
-            "현재 CRM 상태를 짧게 분석해줘",
-            "재구매율을 높이려면 뭘 하면 좋을까?",
-            "VIP 고객 관리 전략을 추천해줘",
-            "오늘 주문 분석 결과에서 주의할 점을 알려줘",
-            "마케팅 문자 보낼 고객 기준을 추천해줘",
-            "2회 구매 고객을 3회 구매로 전환하는 방법을 알려줘",
-            "VIP 고객에게 보낼 문자 문구를 작성해줘",
-        ],
-    )
-
+    quick_q = st.selectbox("빠른 질문", [
+        "현재 CRM 상태를 짧게 분석해줘",
+        "재구매율을 높이려면 뭘 하면 좋을까?",
+        "VIP 고객 관리 전략을 추천해줘",
+        "오늘 주문 분석 결과에서 주의할 점을 알려줘",
+        "마케팅 문자 보낼 고객 기준을 추천해줘",
+        "2회 구매 고객을 3회 구매로 전환하는 방법을 알려줘",
+        "VIP 고객에게 보낼 문자 문구를 작성해줘",
+    ])
     custom_q = st.text_area("직접 질문", placeholder="예: 3회 이상 구매고객에게 어떤 이벤트를 하면 좋을까?")
     question = custom_q.strip() if custom_q.strip() else quick_q
-
-    if st.button("AI에게 질문하기", use_container_width=True):
-        with st.spinner("AI가 CRM 데이터를 분석 중입니다..."):
-            answer = ask_ai_crm(question, customer_df, orders_db)
-        st.markdown(answer)
-
+    if st.button("AI에게 질문하기", use_container_width=True,
+                 key="ai_tab_question_v19", disabled=not ai_ready):
+        with st.spinner("분석 중입니다..."):
+            st.session_state["ai_tab_question_result_v19"] = ask_ai_crm(question, customer_df, orders_db)
+    if st.session_state.get("ai_tab_question_result_v19"):
+        st.markdown(st.session_state["ai_tab_question_result_v19"])
 
 with tab_black:
     st.subheader("블랙리스트 / 주의고객 관리")
