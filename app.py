@@ -1056,9 +1056,9 @@ def parse_uploaded_file_cached(filename, content):
 ITEMS = [
     ("sikhye_1l", "식혜 1L", 150, False),
     ("sikhye_500ml", "식혜 500ml", 100, True),
+    ("sikhye_200ml", "식혜 200ml", 100, False),
     ("pumpkin_1l", "단호박식혜 1L", 60, False),
     ("pumpkin_500ml", "단호박식혜 500ml", 30, False),
-    ("sikhye_200ml", "식혜 200ml", 100, False),
 ]
 KST = ZoneInfo("Asia/Seoul")
 KEYS = [p[0] for p in ITEMS]
@@ -1201,7 +1201,7 @@ def snapshots_weekly(rows, weeks=12, as_of=None):
     for r in rows:
         try:
             d = date.fromisoformat(str(r.get("inventory_date", ""))[:10])
-            if start_week <= d <= as_of and r.get("item_key") in KEYS:
+            if start_week <= d <= as_of and d.weekday() < 5 and r.get("item_key") in KEYS:
                 start = d - timedelta(days=d.weekday())
                 data.append({"주": start.isoformat(), "품목": LABELS[r["item_key"]], "출고수량": _safe_int(r.get("actual_ship_qty")), "날짜": d.isoformat()})
         except ValueError:
@@ -1210,40 +1210,140 @@ def snapshots_weekly(rows, weeks=12, as_of=None):
         return pd.DataFrame(), pd.DataFrame()
     df = pd.DataFrame(data)
     weekly = df.groupby(["주", "품목"], as_index=False).agg(출고수량=("출고수량", "sum"), 기록일수=("날짜", "nunique"))
-    # 미기록일을 0개 출고로 간주하지 않는다. 주간 평균은 기록일수 7일인 주만 사용.
-    completed = weekly[weekly["기록일수"] >= 7]
+    # 평일 5일 기록을 모두 남긴 주만 평균 산출한다. 미기록일은 0출고로 취급하지 않는다.
+    completed = weekly[weekly["기록일수"] >= 5]
     avg = (completed.groupby("품목")["출고수량"].agg(["mean", "count"])
            .reset_index().rename(columns={"mean": "완전한_주간_평균", "count": "분석주수"})) if not completed.empty else pd.DataFrame()
     return weekly, avg
 
 
-def last_year_order_approx(orders_db, as_of, infer_fn):
-    """주문 DB에 품목별 원본행이 없어 명확한 1상품 주문만 제한적으로 추정."""
-    counts = {key: 0 for key in KEYS}
-    info = {"total": 0, "usable": 0}
-    if orders_db is None or orders_db.empty:
-        return counts, info
-    required = {"order_date", "raw_rows", "product_names", "total_quantity", "channel"}
-    if not required.issubset(orders_db.columns):
-        return counts, info
+def _order_dates_kst(orders_db):
+    """주문 시각을 한국 날짜로 통일한다. 기존 주문 테이블은 UTC ISO 문자열을 저장한다."""
+    return pd.to_datetime(orders_db["order_date"], utc=True, errors="coerce").dt.tz_convert(KST).dt.date
+
+
+def historical_weekday_report(orders_db, as_of, infer_fn):
+    """작년 같은 ISO주 월~금: 주문 건수(정확)와 단일 상품 주문의 식별 가능한 병수(부분 집계).
+
+    비교 평균: 동일 주를 포함한 작년 직전 4주간 월~금의 평균. 주문 기록이
+    존재하는 주만 평균 대상으로 하며, 없는 주를 0으로 취급하지 않는다.
+    """
     iso = as_of.isocalendar()
-    last_year_iso = iso.year - 1
-    dt = pd.to_datetime(orders_db["order_date"], utc=True, errors="coerce").dt.tz_convert("Asia/Seoul")
-    weeks = dt.dt.isocalendar()
-    selected = orders_db[(weeks["year"] == last_year_iso) & (weeks["week"] == iso.week)]
-    info["total"] = len(selected)
-    for _, r in selected.iterrows():
-        if _safe_int(r.get("raw_rows")) != 1:
+    try:
+        monday = date.fromisocalendar(iso.year - 1, iso.week, 1)
+    except ValueError:
+        # ISO 53주가 직전 연도에 없다면 52주로 조정하고 화면에 기간을 명시한다.
+        monday = date.fromisocalendar(iso.year - 1, 52, 1)
+    days = [monday + timedelta(days=i) for i in range(5)]
+    week_starts = [monday - timedelta(weeks=i) for i in range(3, -1, -1)]
+    empty_day = {d: {"orders": 0, "eligible": 0, "qty": {k: 0 for k in KEYS}} for d in days}
+    result = {
+        "days": days, "monday": monday, "daily": empty_day,
+        "weekly_4": {}, "4week_coverage": 0,
+        "total_orders": 0, "eligible": 0,
+        "qty": {k: 0 for k in KEYS}, "average_orders_4w": None,
+        "average_qty_4w": {k: None for k in KEYS},
+    }
+    if orders_db is None or orders_db.empty or "order_date" not in orders_db.columns:
+        return result
+    df = orders_db.copy()
+    df["_local_date"] = _order_dates_kst(df)
+    # 전체 수년치 주문에서 날짜별 상품을 모두 분석하지 말고 필요한 4주치만 처리한다.
+    first_day = week_starts[0]
+    last_day = days[-1]
+    df = df[df["_local_date"].between(first_day, last_day)].copy()
+    if df.empty:
+        return result
+    # 하나의 주문이 하나의 원본 상품행인 경우에 한해 품목과 구성 병수를 추정한다.
+    df["_single"] = pd.to_numeric(df.get("raw_rows", pd.Series(index=df.index, dtype="float64")), errors="coerce").eq(1)
+    df["_qty"] = pd.to_numeric(df.get("total_quantity", pd.Series(index=df.index, dtype="float64")), errors="coerce").fillna(0)
+    df["_item"] = None
+    df["_units"] = 0
+    valid = df["_single"] & df["_qty"].gt(0)
+    for idx, row in df.loc[valid].iterrows():
+        name = str(row.get("product_names", ""))
+        if not name or name.lower() == "nan":
             continue
-        product = str(r.get("product_names", ""))
-        if not product or product.lower() == "nan":
+        item_name, pack_units = infer_fn(name, str(row.get("channel", "")))
+        key = classify_label(item_name)
+        if key and _safe_int(pack_units) > 0:
+            df.at[idx, "_item"] = key
+            df.at[idx, "_units"] = _safe_int(pack_units)
+    # 데이터를 갖고 있는 4주만 계산. 미기록은 영업일 0출고가 아니다.
+    for monday_i in week_starts:
+        weekly_days = [monday_i + timedelta(days=i) for i in range(5)]
+        frame = df[df["_local_date"].isin(weekly_days)]
+        if frame.empty:
             continue
-        name, units = infer_fn(product, str(r.get("channel", "")))
-        key = classify_label(name)
-        if key and units >= 1:
-            counts[key] += _safe_int(r.get("total_quantity")) * _safe_int(units)
-            info["usable"] += 1
-    return counts, info
+        counts = {k: 0 for k in KEYS}
+        recognized = frame[frame["_item"].isin(KEYS)]
+        for _, row in recognized.iterrows():
+            counts[row["_item"]] += _safe_int(row["_qty"] * row["_units"])
+        result["weekly_4"][monday_i] = {"orders": len(frame), "eligible": len(recognized), "qty": counts}
+    result["4week_coverage"] = len(result["weekly_4"])
+    if result["4week_coverage"]:
+        n = result["4week_coverage"]
+        result["average_orders_4w"] = sum(x["orders"] for x in result["weekly_4"].values()) / n
+        for key in KEYS:
+            result["average_qty_4w"][key] = sum(x["qty"][key] for x in result["weekly_4"].values()) / n
+    for d in days:
+        frame = df[df["_local_date"] == d]
+        result["daily"][d]["orders"] = len(frame)
+        recognized = frame[frame["_item"].isin(KEYS)]
+        result["daily"][d]["eligible"] = len(recognized)
+        for _, row in recognized.iterrows():
+            key = row["_item"]
+            q = _safe_int(row["_qty"] * row["_units"])
+            result["daily"][d]["qty"][key] += q
+            result["qty"][key] += q
+        result["total_orders"] += len(frame)
+        result["eligible"] += len(recognized)
+    return result
+
+
+def render_historical_production_report(orders_db, as_of, infer_fn):
+    """작년 월~금 주문/품목별 식별 가능한 수량과 주간 평균을 바로 보여준다."""
+    report = historical_weekday_report(orders_db, as_of, infer_fn)
+    days = report["days"]
+    monday = report["monday"]
+    friday = days[-1]
+    st.markdown("### 📅 작년 같은 주 월~금 출고 비교")
+    st.caption(f"대상 기간: **{monday:%Y.%m.%d}(월) ~ {friday:%m.%d}(금)**  |  주문일 기준  |  날짜별·품목별 비교")
+    d_cols = st.columns(3)
+    d_cols[0].metric("작년 월~금 주문", f"{report['total_orders']:,}건")
+    d_cols[1].metric("작년 하루 평균 주문", f"{report['total_orders']/5:,.1f}건")
+    avg_orders = report["average_orders_4w"]
+    d_cols[2].metric("작년 인접 4주 월~금 평균", f"{avg_orders:,.1f}건" if avg_orders is not None else "자료 없음")
+    if report["total_orders"] == 0:
+        st.info("작년 해당 월~금에 저장된 주문이 없습니다. DB에 그 기간 주문이 들어있는지 확인해주세요. 기록이 없다고 실제 출고가 0개였던 것은 아닙니다.")
+    n_weeks = report["4week_coverage"]
+    if n_weeks < 4:
+        st.caption(f"작년 같은 주와 직전 3주 중 주문 기록이 확인되는 기간: **{n_weeks}/4주**. 미기록 주를 0으로 처리하지 않습니다.")
+    st.markdown("**품목별 월~금 수량 비교**")
+    labels = ["월", "화", "수", "목", "금"]
+    rows = []
+    for key, label, _, _ in ITEMS:
+        avg = report["average_qty_4w"][key]
+        row = {"품목": label}
+        for d, day_label in zip(days, labels):
+            row[f"{day_label} {d:%m/%d}"] = report["daily"][d]["qty"][key] if report["total_orders"] else "—"
+        row["5일 합계"] = report["qty"][key] if report["total_orders"] else "—"
+        row["하루 평균"] = round(report["qty"][key] / 5, 1) if report["total_orders"] else "—"
+        row["인접 주간 평균"] = round(avg, 1) if avg is not None else "—"
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption(
+        f"⚠️ 위의 품목 수량은 **단일상품 주문 {report['eligible']:,}건 / 해당 주 전체 {report['total_orders']:,}건**을 이용해 계산한 "
+        "**확인 가능한 부분 수량**입니다. 혼합 주문과 택배 외 출고는 누락될 수 있어 실제 전체 출고량과 다릅니다. "
+        f"'인접 주간 평균'은 작년 해당 주와 그 이전 3주 중 기록이 있는 {n_weeks}주의 월~금 평균입니다. "
+        "정확한 생산량 판단에는 과거 원본 상품별 주문 엑셀이 필요합니다."
+    )
+    if report["total_orders"] > 0:
+        day_orders = "  |  ".join(
+            f"{weekday} {report['daily'][day]['orders']:,}건"
+            for day, weekday in zip(days, labels)
+        )
+        st.caption("📋 작년 요일별 주문 건수: " + day_orders)
 
 
 def save_inventory(records, summary_note=""):
@@ -1282,147 +1382,160 @@ def _draft_key(as_of, key, field):
     return f"inventory_{as_of.isoformat()}_{key}_{field}"
 
 
+def _weekly_order_counts(orders_db, as_of):
+    """주문 DB의 날짜로 ISO 연도/주를 비교한다. 병 수량이 아닌 주문 건수."""
+    this_year, this_week, _ = as_of.isocalendar()
+    if orders_db is None or orders_db.empty or "order_date" not in orders_db.columns:
+        return 0, 0
+    dates = pd.to_datetime(orders_db["order_date"], utc=True, errors="coerce")
+    weeks = dates.dt.isocalendar()
+    cur = int(((weeks["year"] == this_year) & (weeks["week"] == this_week)).sum())
+    prior = int(((weeks["year"] == this_year - 1) & (weeks["week"] == this_week)).sum())
+    return cur, prior
+
+
 def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shipping_item):
     as_of = datetime.now(KST).date()
     st.subheader("📦 재고관리")
-    st.caption("품목별 재고 확인 → 출고 수정 → 생산 입고 → 최종 확인 후 직접 저장")
+    st.caption(f"{as_of:%Y년 %m월 %d일} 기준  |  수량 확인 → 수정 → 최종 저장  |  생산 후 늘어난 수량은 '기존 재고'에 직접 반영하세요.")
+
     history_rows, error = fetch_inventory_rows()
     today_saved = existing_today(history_rows, as_of)
     prev_saved = previous_inventory(history_rows, as_of)
     auto, unknown = today_shipment(raw_orders, shipping_summary_func)
-
     if error:
         st.warning(error)
     if raw_orders is None or raw_orders.empty:
-        st.info("오늘 엑셀을 업로드하지 않았습니다. 출고량은 0개로 표시되므로 수동으로 수정할 수 있습니다.")
+        st.caption("ℹ️ 오늘 업로드한 엑셀이 없어 자동 출고가 0개입니다. 이전 저장값이 있으면 그대로 표시됩니다.")
     if unknown:
-        st.warning("분류되지 않은 상품이 있습니다. 오늘 출고 총합의 기타 품목을 확인하세요: " + ", ".join(f"{a} {b}개" for a, b in unknown))
+        st.warning("자동 분류되지 않은 품목: " + ", ".join(f"{a} {b}개" for a, b in unknown))
 
-    # 기존 재고의 다음날 이월, 저장된 당일 재고의 재편집을 구분한다.
-    rows = []
-    st.markdown("#### 오늘 품목별 재고")
-    st.caption("기준재고는 시작 시점의 재고입니다. 실제 출고는 엑셀 자동값을 바탕으로 수정할 수 있습니다.")
+    st.markdown("### 오늘 품목별 재고")
+    st.caption("**기존 재고** = 오늘 출고 전에 남아 있는 수량(생산 후에는 이 수량을 직접 수정)  /  **오늘 출고** = 실제 나간 수량  /  **남은 재고** = 자동 계산")
+
+    head = st.columns([2.2, 1.55, 1.55, 1.4], gap="small")
+    for col, label in zip(head, ["품목", "오늘 출고 ✏️", "기존 재고 ✏️", "남은 재고"]):
+        col.markdown(f"**{label}**")
+
+    records = []
     for key, label, threshold, inclusive in ITEMS:
         saved = today_saved.get(key, {})
-        opening_default = _safe_int(saved["opening_qty"]) if saved else prev_saved.get(key, (None, 0))[1]
-        inbound_default = _safe_int(saved.get("received_qty", 0))
+        # 예전 버전의 생산/입고값도 기존 재고에 합쳐서 불러와야 재고가 줄어들지 않는다.
+        opening_default = (
+            _safe_int(saved.get("opening_qty", 0)) + _safe_int(saved.get("received_qty", 0))
+            if saved else prev_saved.get(key, (None, 0))[1]
+        )
         actual_default = _safe_int(saved.get("actual_ship_qty", auto[key]))
-
-        # 엑셀 출고량이 달라지면 사용자가 수동 보정했던 차이는 그대로 유지합니다.
         actual_key = _draft_key(as_of, key, "actual")
         auto_key = _draft_key(as_of, key, "last_auto")
+        opening_key = _draft_key(as_of, key, "stock_v13")
         if actual_key not in st.session_state:
             st.session_state[actual_key] = actual_default
             st.session_state[auto_key] = auto[key]
         elif st.session_state.get(auto_key, auto[key]) != auto[key]:
+            # 엑셀이 추가/변경돼도 기존 직접 수정분은 보존한다.
             delta = auto[key] - st.session_state[auto_key]
             st.session_state[actual_key] = max(0, int(st.session_state[actual_key]) + delta)
             st.session_state[auto_key] = auto[key]
 
         with st.container(border=True):
-            col_title, col_auto = st.columns([3, 1.5], vertical_alignment="center")
-            col_title.markdown(f"**{label}**")
-            col_auto.caption(f"엑셀 출고 {auto[key]:,}개")
-            inputs = st.columns(3, gap="small")
-            opening = inputs[0].number_input("기준 재고", min_value=0, step=1,
-                value=opening_default, key=_draft_key(as_of, key, "opening"))
-            received = inputs[1].number_input("생산/입고", min_value=0, step=1,
-                value=inbound_default, key=_draft_key(as_of, key, "received"))
-            actual = inputs[2].number_input("실제 출고 (수정 가능)", min_value=0, step=1,
-                key=actual_key)
-            closing = int(opening) + int(received) - int(actual)
+            c_name, c_out, c_stock, c_left = st.columns([2.2, 1.55, 1.55, 1.4], gap="small", vertical_alignment="center")
+            with c_name:
+                st.markdown(f"**{label}**")
+                st.caption(f"엑셀 자동 {auto[key]:,}개  ·  부족 기준 {threshold}개{' 이하' if inclusive else ' 미만'}")
+            with c_out:
+                actual = st.number_input(
+                    f"{label} 오늘 출고", min_value=0, step=1,
+                    key=actual_key, label_visibility="collapsed",
+                )
+            with c_stock:
+                opening = st.number_input(
+                    f"{label} 기존 재고", min_value=0, step=1,
+                    value=opening_default, key=opening_key, label_visibility="collapsed",
+                )
+            closing = int(opening) - int(actual)
             low = _is_low(key, closing)
-            status = "🔴 재고 부족" if low else "🟢 정상"
-            st.markdown(f"**출고 후 재고: {closing:,}개**　 |　 {status}　 |　 알림 기준 {threshold}개{' 이하' if inclusive else ' 미만'}")
+            with c_left:
+                color = "#c62828" if low or closing < 0 else "#18794e"
+                status = "🔴 부족" if low else "🟢 정상"
+                st.markdown(
+                    f'<div style="font-size:23px;font-weight:800;color:{color};line-height:1.25">{closing:,}개</div>'
+                    f'<div style="font-size:12px;color:{color};margin-top:3px">{status}</div>',
+                    unsafe_allow_html=True,
+                )
+            records.append({
+                "inventory_date": as_of.isoformat(), "item_key": key,
+                "opening_qty": int(opening), "received_qty": 0,
+                "auto_ship_qty": auto[key], "actual_ship_qty": int(actual),
+                "closing_qty": closing,
+            })
 
-        rows.append({"inventory_date": as_of.isoformat(), "item_key": key,
-                     "opening_qty": int(opening), "received_qty": int(received),
-                     "auto_ship_qty": auto[key], "actual_ship_qty": int(actual),
-                     "closing_qty": closing})
-
-    st.caption("부족 기준: 식혜 1L 150개 미만 / 식혜 500ml 100개 이하 / 단호박 1L 60개 미만 / 단호박 500ml 30개 미만 / 식혜 200ml 100개 미만")
-    low_rows = [r for r in rows if _is_low(r["item_key"], r["closing_qty"])]
-    col_alert, col_excel, col_saved = st.columns(3)
-    col_alert.metric("재고 부족 품목", f"{len(low_rows)}종")
-    col_excel.metric("엑셀 인식 품목", f"{sum(1 for k in KEYS if auto[k] > 0)}종")
-    col_saved.metric("오늘 저장된 품목", f"{len(today_saved)}종")
+    low_rows = [r for r in records if _is_low(r["item_key"], r["closing_qty"])]
+    negative = any(r["closing_qty"] < 0 for r in records)
     if low_rows:
-        st.error("생산 확인 필요: " + ", ".join(LABELS[r["item_key"]] for r in low_rows))
-    if any(r["closing_qty"] < 0 for r in rows):
-        st.error("남은 재고가 음수인 품목이 있습니다. 기준 재고 또는 출고량을 확인하세요.")
+        st.warning("⚠️ 재고 부족 " + str(len(low_rows)) + "종: " + ", ".join(LABELS[r["item_key"]] for r in low_rows))
+    else:
+        st.success("✅ 모든 품목이 설정한 재고 기준 이상입니다.")
+    if negative:
+        st.error("출고량이 기존 재고보다 많은 품목이 있습니다. 수량을 확인해야 저장할 수 있습니다.")
 
-    note = st.text_input("재고 저장 메모 (선택)", key=_draft_key(as_of, "all", "note"), placeholder="예: 매장 출고 5개 반영 / 생산 200개 추가")
-    submitted = st.button("💾 최종 재고 DB 저장", type="primary", use_container_width=True, disabled=any(r["closing_qty"] < 0 for r in rows) or bool(error))
-    if submitted:
+    # 기존 스키마는 opening_qty + received_qty - actual_ship_qty = closing_qty를 사용하므로
+    # received_qty는 0으로 저장하고, 생산량은 opening_qty에 직접 반영한다.
+    note = st.text_input(
+        "변경 메모 (선택)", key=_draft_key(as_of, "all", "note_v13"),
+        placeholder="예: 생산 후 실물 재고로 수정 / 택배 외 8개 추가 출고",
+    )
+    if st.button("💾 오늘 재고 최종 저장", type="primary", use_container_width=True,
+                 disabled=negative or bool(error)):
         try:
-            audit_ok = save_inventory(rows, note)
-            st.success("재고 저장 완료. 같은 날짜에 다시 저장하면 해당 날짜의 최종 값을 수정합니다.")
+            audit_ok = save_inventory(records, note)
+            st.success("오늘 재고를 저장했습니다. 다시 수정해 저장하면 최신 수량으로 덮어씁니다.")
             if not audit_ok:
-                st.warning("현재고는 저장되었지만 변경 이력 저장에 실패했습니다. inventory_audit 테이블을 확인하세요.")
+                st.warning("최종 재고는 저장됐지만 변경 이력 저장은 실패했습니다.")
             st.rerun()
         except Exception as exc:
-            st.error(f"재고 저장에 실패했습니다. DB 설정을 확인해주세요. ({type(exc).__name__}: {str(exc)[:180]})")
+            st.error(f"저장 실패: {type(exc).__name__} - {str(exc)[:150]}")
 
     st.divider()
-    st.markdown("#### 💬 카카오톡 복사")
-    st.caption("문자 간격이 깨지지 않도록 표 대신 줄바꿈 형식으로 만듭니다. 아래 메시지 오른쪽 위의 복사 아이콘을 누르세요.")
-    simple, detailed = st.tabs(["출고 + 남은 재고", "칠판용 남은 재고만"])
-    with simple:
-        st.code(make_message(as_of, rows, compact=False), language=None)
-    with detailed:
-        st.code(make_message(as_of, rows, compact=True), language=None)
-    st.caption("카톡용 메시지는 현재 화면의 수정값을 반영합니다. 저장한 뒤 복사하는 것을 권장합니다.")
+    render_historical_production_report(orders_db, as_of, infer_shipping_item)
 
-    st.divider()
-    st.markdown("#### 📈 주별 출고 비교와 생산 참고")
-    weeks = st.select_slider("주간 조회 기간", options=[4, 8, 12, 26, 52], value=12, format_func=lambda n: f"최근 {n}주")
-    weekly, avg = snapshots_weekly(history_rows, weeks=weeks, as_of=as_of)
-    if weekly.empty:
-        st.info("아직 품목별 날짜 재고 기록이 없습니다. 오늘부터 저장하면 정확한 주별 출고 기록이 쌓입니다.")
-    else:
-        pivot = weekly.pivot_table(index="주", columns="품목", values="출고수량", aggfunc="sum", fill_value=0)
-        st.bar_chart(pivot)
-        with st.expander("주별 출고량 세부 내역"):
+    with st.expander("📈 최근 주간 출고 추이 (새 재고 저장 이력)", expanded=False):
+        weeks = st.select_slider("조회 기간", options=[4, 8, 12, 26, 52], value=12,
+                                 format_func=lambda n: f"최근 {n}주")
+        weekly, avg = snapshots_weekly(history_rows, weeks=weeks, as_of=as_of)
+        if weekly.empty:
+            st.info("아직 저장된 재고 기록이 없습니다. 앞으로 실제 출고량을 저장하면 주간 기록이 쌓입니다.")
+        else:
+            pivot = weekly.pivot_table(index="주", columns="품목", values="출고수량", aggfunc="sum", fill_value=0)
+            st.bar_chart(pivot)
             st.dataframe(weekly, use_container_width=True, hide_index=True)
-        if avg.empty:
-            st.info("최근 기간에 7일 모두 기록된 주가 없어 신뢰할 만한 주간 평균을 계산하지 않았습니다.")
-        else:
-            st.markdown("**완전 기록된 주 기준 평균**")
-            st.dataframe(avg.round(1), use_container_width=True, hide_index=True)
+            if not avg.empty:
+                st.caption("월~금 5일 모두 기록한 주만 평균 계산에 포함")
+                st.dataframe(avg.round(1), use_container_width=True, hide_index=True)
+            else:
+                st.caption("월~금 5일 모두 기록된 주가 없어 아직 평균을 표시하지 않습니다.")
 
-    # 작년 주간 데이터가 실주문 상세가 아닌 주문 단위로만 저장된 경우 추정임을 명시.
-    with st.expander("작년 같은 주 비교 (기존 주문 DB 기반 추정)"):
-        # 주문 건수는 기존 orders 테이블에서 정확히 세고, 품목별 병 수량은 제한적으로 추정합니다.
-        if orders_db is not None and not orders_db.empty and "order_date" in orders_db.columns:
-            dates = pd.to_datetime(orders_db["order_date"], utc=True, errors="coerce").dt.tz_convert("Asia/Seoul")
-            iso = dates.dt.isocalendar()
-            current_iso = as_of.isocalendar()
-            count_this = int(((iso["year"] == current_iso.year) & (iso["week"] == current_iso.week)).sum())
-            count_last = int(((iso["year"] == current_iso.year - 1) & (iso["week"] == current_iso.week)).sum())
-            metric_this, metric_last = st.columns(2)
-            metric_this.metric("올해 같은 주 주문 건수", f"{count_this:,}건")
-            metric_last.metric("작년 같은 주 주문 건수", f"{count_last:,}건")
-            st.caption("주문 건수는 저장된 주문번호 기준입니다. 출고 병 수량과는 다릅니다.")
-        historic, coverage = last_year_order_approx(orders_db, as_of, infer_shipping_item)
-        if coverage["total"] == 0:
-            st.info("작년 같은 주 저장 주문이 없습니다.")
-        elif coverage["usable"] == 0:
-            st.info("작년 같은 주 주문은 있으나 품목별 실제 출고를 추정할 수 없습니다.")
-        else:
-            st.warning(f"주의: 작년 같은 주 {coverage['total']:,}건 중 단일상품 주문 {coverage['usable']:,}건만 계산했습니다. 혼합 주문 등은 제외되어 실제 출고보다 적을 수 있습니다. 생산량 결정에 단독 사용하지 마세요.")
-            df = pd.DataFrame([{"품목": label, "작년 같은 주 확인 가능 수량(추정 최소치)": historic[k]} for k, label, _, _ in ITEMS])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+    st.divider()
+    st.markdown("### 💬 카톡 복사")
+    st.caption("현재 화면에서 수정한 수량으로 바로 생성됩니다. 보내기 전에 최종 저장을 권장합니다.")
+    simple, compact = st.tabs(["오늘 출고 + 남은 재고", "칠판용 재고만"])
+    with simple:
+        st.code(make_message(as_of, records, compact=False), language=None)
+    with compact:
+        st.code(make_message(as_of, records, compact=True), language=None)
+    st.caption("각 문구 오른쪽 위 복사 아이콘을 누르면 카카오톡에 그대로 붙여넣을 수 있습니다.")
 
-    with st.expander("재고 저장 이력 조회"):
+    with st.expander("🕒 지난 재고 저장 내역", expanded=False):
         if not history_rows:
-            st.info("저장된 재고 기록이 없습니다.")
+            st.info("저장 내역이 없습니다.")
         else:
             history = pd.DataFrame(history_rows)
             history["품목"] = history["item_key"].map(LABELS)
-            desired = ["inventory_date", "품목", "opening_qty", "received_qty", "actual_ship_qty", "closing_qty", "updated_at"]
-            st.dataframe(history[[x for x in desired if x in history.columns]].rename(columns={
-                "inventory_date": "날짜", "opening_qty": "기준재고", "received_qty": "입고",
-                "actual_ship_qty": "실제출고", "closing_qty": "남은재고", "updated_at": "저장시각",
+            history["기존재고"] = history["opening_qty"].fillna(0) + history["received_qty"].fillna(0)
+            fields = ["inventory_date", "품목", "기존재고", "actual_ship_qty", "closing_qty", "updated_at"]
+            st.dataframe(history[[x for x in fields if x in history.columns]].rename(columns={
+                "inventory_date": "날짜", "actual_ship_qty": "오늘출고",
+                "closing_qty": "남은재고", "updated_at": "저장시각",
             }), use_container_width=True, hide_index=True)
 
 
