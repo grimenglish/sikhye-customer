@@ -2260,7 +2260,7 @@ with tab_upload:
             st.download_button(
                 "💾 CJ 송장용 엑셀 저장",
                 data=cj_bytes,
-                file_name=f"{cj_uploaded.name.rsplit('.', 1)[0]}_CJ용.xlsx",
+                file_name=f"변완 네이버 송장 ({datetime.now(ZoneInfo('Asia/Seoul')).strftime('%Y%m%d')}).xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 use_container_width=True,
