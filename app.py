@@ -1508,7 +1508,13 @@ def _weekly_order_counts(orders_db, as_of):
 
 def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shipping_item):
     as_of = datetime.now(KST).date()
-    st.subheader("📦 재고관리")
+    # 화면 상단에서 카톡 문구를 바로 복사할 수 있도록 자리부터 확보한다.
+    # 재고 입력값이 모두 계산된 다음 이 빈 자리에 복사 메뉴를 렌더링한다.
+    title_col, quick_copy_col = st.columns([5.8, 1.5], gap="small", vertical_alignment="center")
+    with title_col:
+        st.subheader("📦 재고관리")
+    with quick_copy_col:
+        quick_copy_slot = st.empty()
     st.caption(f"{as_of:%Y년 %m월 %d일} 기준  |  출고와 기존 재고 확인 → 저장  |  저장한 실출고량이 내년 같은 주 생산 참고자료가 됩니다.")
 
     history_rows, error = fetch_inventory_rows()
@@ -1585,6 +1591,18 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
                 "auto_ship_qty": auto[key], "actual_ship_qty": int(actual),
                 "closing_qty": closing,
             })
+
+    # 상단 버튼: 끝까지 스크롤하지 않고, 입력 중인 최신 수량으로 문구 확인/복사.
+    # st.code의 기본 복사 아이콘을 이용하므로 추가 라이브러리와 JS가 필요 없다.
+    with quick_copy_slot.container():
+        with st.popover("📋 카톡 복사", use_container_width=True):
+            st.caption("오늘 출고 / 남은 재고 · 지금 입력한 수량 기준")
+            st.code(make_message(as_of, records, compact=False), language=None)
+            st.caption("문구 오른쪽 위 📋 아이콘을 누르면 복사됩니다.")
+            st.divider()
+            st.caption("칠판용: 남은 재고만")
+            st.code(make_message(as_of, records, compact=True), language=None)
+            st.caption("※ DB 저장은 별도입니다. 수량을 확정하려면 아래 최종 저장을 눌러주세요.")
 
     low_rows = [r for r in records if _is_low(r["item_key"], r["closing_qty"])]
     negative = any(r["closing_qty"] < 0 for r in records)
