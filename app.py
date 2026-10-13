@@ -2,6 +2,7 @@
 import io
 import re
 import json
+import math
 from datetime import datetime, date
 
 from datetime import timedelta
@@ -32,7 +33,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.block-container {padding-top: 2rem;}
+.block-container {padding-top: 1.4rem; max-width: 1500px; padding-bottom: 3rem;}
 .kpi-card {
     background: white;
     border: 1px solid #ECECEC;
@@ -121,16 +122,59 @@ st.markdown("""
     background: #ffffff !important;
 }
 [data-testid="stDataFrame"] div {
-    font-size: 13px;
+    font-size: 15px;
 }
 
 
-/* 실제 Streamlit 파일 업로더 드래그앤드롭 영역 확대 */
+/* V21: 실제 업로더를 3배 가까이 크게, 버튼은 터치하기 편하게 */
 [data-testid="stFileUploaderDropzone"] {
-    min-height: 130px !important;
-    border: 2px dashed #94a3b8 !important;
-    border-radius: 18px !important;
-    background: #f8fafc !important;
+    min-height: 345px !important;
+    padding: 65px 28px !important;
+    border: 3px dashed #94a3b8 !important;
+    border-radius: 22px !important;
+    background: linear-gradient(155deg, #f8fbff, #eef5ff) !important;
+    cursor: pointer !important;
+    transition: background .2s ease, border-color .2s ease !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover {
+    border-color: #2563eb !important;
+    background: #eaf3ff !important;
+}
+[data-testid="stFileUploaderDropzone"] button {
+    min-height: 58px !important;
+    min-width: 165px !important;
+    padding: 12px 24px !important;
+    border-radius: 14px !important;
+    font-size: 19px !important;
+    font-weight: 750 !important;
+    color: #123b78 !important;
+    border: 2px solid #93b4e8 !important;
+    background: white !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] {
+    min-width: 0 !important;
+    text-align: center !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] * {
+    font-size: 18px !important;
+    line-height: 1.55 !important;
+}
+[data-testid="stFileUploaderDropzone"] svg { width: 42px !important; height: 42px !important; }
+[data-testid="stFileUploader"] small { font-size: 14px !important; }
+[data-testid="stFileUploader"] label { font-size: 17px !important; font-weight: 750 !important; }
+
+/* CRM 전체 텍스트 가독성 + 버튼 클릭 면적 */
+[data-testid="stMetricLabel"] p { font-size: 15px !important; }
+[data-testid="stMetricValue"] div { font-size: clamp(22px, 2vw, 32px) !important; font-weight: 750 !important; }
+.stTabs [data-baseweb="tab"] { font-size: 15px !important; min-height: 47px !important; }
+.stButton button[kind="primary"] { min-height: 45px; border-radius: 11px; font-weight: 700; }
+[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+.vg-tooltip, #vg-tooltip-element { font-size: 17px !important; line-height: 1.55 !important; }
+.vg-tooltip td, .vg-tooltip th { font-size: 16px !important; padding: 7px 11px !important; }
+@media (max-width: 650px) {
+    [data-testid="stFileUploaderDropzone"] { min-height: 245px !important; padding: 33px 12px !important; }
+    [data-testid="stFileUploaderDropzone"] button { min-height: 48px !important; min-width: 130px !important; font-size: 16px !important; }
+    [data-testid="stFileUploaderDropzoneInstructions"] * { font-size: 15px !important; }
 }
 
 </style>
@@ -157,7 +201,8 @@ def require_login():
         with st.sidebar:
             st.success("로그인됨")
             if st.button("로그아웃"):
-                st.session_state["authenticated"] = False
+                # 다른 사람이 같은 브라우저를 열었을 때 고객/업로드 정보가 남지 않게 정리
+                st.session_state.clear()
                 st.rerun()
         return
 
@@ -181,17 +226,19 @@ require_login()
 # =========================
 # Supabase 연결
 # =========================
+@st.cache_resource(show_spinner=False)
+def _cached_supabase_client(url, key):
+    return create_client(url, key)
+
+
 def get_supabase():
     if create_client is None:
         return None
-
     url = st.secrets.get("SUPABASE_URL", "")
     key = st.secrets.get("SUPABASE_KEY", "")
-
     if not url or not key:
         return None
-
-    return create_client(url, key)
+    return _cached_supabase_client(url, key)
 
 
 sb = get_supabase()
@@ -399,6 +446,7 @@ def make_order_level(raw_orders, use_strict=False):
     return grouped
 
 
+@st.cache_data(ttl=180, max_entries=4, show_spinner=False)
 def make_customer_df(order_level):
     if order_level.empty:
         return pd.DataFrame()
@@ -510,6 +558,8 @@ def upsert_orders(order_level):
         saved_count += save_chunk_safely(chunk)
 
     fetch_all.clear()
+    st.session_state.pop("_crm_excel_bytes_v21", None)
+    st.session_state["_orders_revision_v21"] = st.session_state.get("_orders_revision_v21", 0) + 1
     return saved_count
 
 
@@ -550,6 +600,8 @@ def save_blacklist(row):
     row["updated_at"] = datetime.now().isoformat(timespec="seconds")
     sb.table("blacklist").upsert([row], on_conflict="customer_key").execute()
     fetch_all.clear()
+    st.session_state.pop("_crm_excel_bytes_v21", None)
+    st.session_state["_crm_customer_flags_revision_v21"] = st.session_state.get("_crm_customer_flags_revision_v21", 0) + 1
 
 
 def delete_blacklist(customer_key):
@@ -557,6 +609,8 @@ def delete_blacklist(customer_key):
         return
     sb.table("blacklist").delete().eq("customer_key", customer_key).execute()
     fetch_all.clear()
+    st.session_state.pop("_crm_excel_bytes_v21", None)
+    st.session_state["_crm_customer_flags_revision_v21"] = st.session_state.get("_crm_customer_flags_revision_v21", 0) + 1
 
 
 
@@ -588,6 +642,8 @@ def save_customer_note(customer_key, customer_name, phone, address, memo):
     }
     sb.table("blacklist").upsert([row], on_conflict="customer_key").execute()
     fetch_all.clear()
+    st.session_state.pop("_crm_excel_bytes_v21", None)
+    st.session_state["_crm_customer_flags_revision_v21"] = st.session_state.get("_crm_customer_flags_revision_v21", 0) + 1
 
 
 @st.cache_data(ttl=300, max_entries=3, show_spinner=False)
@@ -1102,6 +1158,27 @@ def parse_uploaded_file_cached(filename, content):
     return std, market, len(raw)
 
 
+@st.cache_data(ttl=900, max_entries=5, show_spinner=False)
+def _prepare_uploaded_files(file_blobs):
+    """파일들의 바이트가 같으면 엑셀 파싱과 주문 단위 병합을 반복하지 않는다."""
+    frames, errors, logs = [], [], []
+    for filename, content in file_blobs:
+        try:
+            std, market, raw_len = parse_uploaded_file_cached(filename, content)
+            frames.append(std)
+            logs.append({"파일명": filename, "채널": market, "원본행": raw_len,
+                         "정리행": len(std), "상태": "성공"})
+        except Exception as exc:
+            errors.append((filename, str(exc)))
+            logs.append({"파일명": filename, "채널": "", "원본행": 0,
+                         "정리행": 0, "상태": "실패"})
+    if not frames:
+        return pd.DataFrame(), pd.DataFrame(), logs, errors
+    raw = pd.concat(frames, ignore_index=True)
+    order_level = make_order_level(raw, use_strict=False)
+    return raw, order_level, logs, errors
+
+
 # ===== 재고관리 통합 기능 (별도 모듈 필요 없음) =====
 # 품목 코드는 저장 후 이름이 바뀌더라도 유지되는 키로 사용한다.
 ITEMS = [
@@ -1269,8 +1346,8 @@ def render_oneclick_copy_button(message, label, button_id, accent=False):
     </div>
     <style>
       #{button_id} {{display:flex; align-items:center; gap:6px; width:100%; font-family:inherit;}}
-      #{button_id} .inventory-copy-button {{cursor:pointer; font-family:inherit; font-size:13px; font-weight:600; line-height:1.3;
-        box-sizing:border-box; width:100%; min-height:37px; padding:8px 6px; border-radius:8px;
+      #{button_id} .inventory-copy-button {{cursor:pointer; font-family:inherit; font-size:15px; font-weight:700; line-height:1.4;
+        box-sizing:border-box; width:100%; min-height:44px; padding:9px 9px; border-radius:10px;
         background:{tone}; color:#173023; border:1px solid {border}; white-space:nowrap;}}
       #{button_id} .inventory-copy-button:hover {{filter:brightness(.97)}}
       #{button_id} .inventory-copy-button:focus-visible {{outline:2px solid #2a8a5b; outline-offset:2px}}
@@ -1686,8 +1763,15 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
         actual_key = _draft_key(as_of, key, "actual")
         auto_key = _draft_key(as_of, key, "last_auto")
         opening_key = _draft_key(as_of, key, "stock_v13")
+        # Streamlit의 지연 렌더링에서 탭을 옮기면 위젯 키가 정리될 수 있다.
+        # 확정 저장 전의 수량은 별도 세션 초안 키에 보관해 다시 돌아왔을 때 복구한다.
+        draft_actual_key = f"_draft_keep_{actual_key}"
+        draft_opening_key = f"_draft_keep_{opening_key}"
+        opening_default = int(st.session_state.get(draft_opening_key, opening_default))
         if actual_key not in st.session_state:
-            st.session_state[actual_key] = actual_default
+            last_auto = int(st.session_state.get(auto_key, auto[key]))
+            retained = int(st.session_state.get(draft_actual_key, actual_default))
+            st.session_state[actual_key] = max(0, retained + int(auto[key]) - last_auto)
             st.session_state[auto_key] = auto[key]
         elif st.session_state.get(auto_key, auto[key]) != auto[key]:
             # 엑셀이 추가/변경돼도 기존 직접 수정분은 보존한다.
@@ -1710,6 +1794,9 @@ def render_inventory(raw_orders, orders_db, shipping_summary_func, infer_shippin
                     f"{label} 기존 재고", min_value=0, step=1,
                     value=opening_default, key=opening_key, label_visibility="collapsed",
                 )
+            # 위젯이 표시된 현재 입력값을 별도 초안으로 유지 (DB 저장 아님).
+            st.session_state[draft_actual_key] = int(actual)
+            st.session_state[draft_opening_key] = int(opening)
             closing = int(opening) - int(actual)
             low = _is_low(key, closing)
             with c_left:
@@ -1832,7 +1919,7 @@ with st.expander("사용법"):
 
 tab_upload, tab_today, tab_inventory, tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_orders, tab_download = st.tabs([
     "⬆️ 엑셀 업로드", "🔥 오늘 주문 분석", "📦 재고관리", "📊 대시보드", "👤 고객 CRM", "🔎 고객 상세", "⭐ VIP", "🤖 AI CRM 비서", "🚫 블랙리스트", "📦 주문 DB", "⬇️ 다운로드"
-])
+], on_change="rerun", key="crm_main_tabs")
 
 if "today_order_preview" not in st.session_state:
     st.session_state["today_order_preview"] = pd.DataFrame()
@@ -1843,11 +1930,13 @@ if "today_customer_analysis" not in st.session_state:
 if "today_detail_analysis" not in st.session_state:
     st.session_state["today_detail_analysis"] = pd.DataFrame()
 
+# 업로드 위젯은 항상 렌더링해 탭을 옮겼다가 돌아와도 파일 선택이 유지되게 한다.
+# 실제 주문 파싱·분석은 업로드 탭을 열었을 때에만 수행한다.
 with tab_upload:
     st.markdown("""
-    <div class="upload-guide">
-        <div class="upload-title">📂 쿠팡/네이버 엑셀 업로드</div>
-        <div class="upload-sub">바로 아래 파일 업로드 박스에 끌어다 놓거나 클릭하세요.</div>
+    <div class="upload-guide" style="padding:14px 16px;margin-bottom:9px;border:1px solid #dbeafe;background:#f0f7ff;">
+        <div class="upload-title" style="font-size:21px;">📂 쿠팡 · 네이버 주문 엑셀</div>
+        <div class="upload-sub" style="font-size:15px;">아래 커다란 영역 어디든 끌어놓거나 <b>Upload 버튼</b>을 클릭하세요. 여러 파일을 한꺼번에 넣어도 됩니다.</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1856,620 +1945,913 @@ with tab_upload:
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
         help="쿠팡 DeliveryList, 네이버 스마트스토어 엑셀을 여러 개 동시에 올릴 수 있습니다.",
+        key=f"crm_excel_uploader_v21_{st.session_state.get('_upload_widget_version_v21', 0)}",
     )
 
-    if uploaded_files:
-        frames, errors = [], []
+if tab_upload.open:
+    with tab_upload:
+        if uploaded_files:
+            # Streamlit은 위젯 변경 시 스크립트를 재실행한다. 동일 업로드 파일은 분석결과를 재사용한다.
+            import hashlib
+            blobs = tuple((f.name, f.getvalue()) for f in uploaded_files)
+            signature = tuple((name, len(content), hashlib.sha256(content).hexdigest())
+                              for name, content in blobs)
+            with st.spinner("엑셀 주문 내역을 분석하는 중입니다. 같은 파일은 다시 계산하지 않습니다..."):
+                raw_orders, order_preview, read_logs, errors = _prepare_uploaded_files(blobs)
+            log_df = pd.DataFrame(read_logs)
+            success_count = int((log_df["상태"] == "성공").sum()) if not log_df.empty else 0
+            fail_count = int((log_df["상태"] == "실패").sum()) if not log_df.empty else 0
+            st.markdown(f'<div class="summary-box">✅ 읽기 완료 · 성공 <b>{success_count:,}</b>개 / 실패 <b>{fail_count:,}</b>개</div>',
+                        unsafe_allow_html=True)
+            with st.expander("파일별 처리 결과"):
+                if not log_df.empty:
+                    st.dataframe(log_df, use_container_width=True, hide_index=True)
+            for name, msg in errors:
+                st.error(f"{name}: {msg}")
 
-        read_logs = []
+            if not raw_orders.empty:
+                # 고객 신규/재구매 판정은 파일 변경 또는 주문 DB 갱신 시에만 다시 실행한다.
+                orders_db_current = fetch_orders_as_order_level()
+                db_signature = (len(orders_db_current),
+                                str(orders_db_current["updated_at"].max()) if "updated_at" in orders_db_current.columns and not orders_db_current.empty else "")
+                analysis_signature = (signature, db_signature,
+                                      st.session_state.get("_orders_revision_v21", 0),
+                                      st.session_state.get("_crm_customer_flags_revision_v21", 0))
+                if st.session_state.get("_upload_analysis_signature_v21") != analysis_signature:
+                    customer_df_current = make_customer_df(orders_db_current) if not orders_db_current.empty else pd.DataFrame()
+                    black_df_current = fetch_blacklist()
+                    today_customer_analysis, today_detail_analysis = analyze_today_orders(
+                        order_preview, orders_db_current, customer_df_current, black_df_current)
+                    st.session_state["today_raw_orders"] = raw_orders
+                    st.session_state["today_order_preview"] = order_preview
+                    st.session_state["today_customer_analysis"] = today_customer_analysis
+                    st.session_state["today_detail_analysis"] = today_detail_analysis
+                    st.session_state["_upload_analysis_signature_v21"] = analysis_signature
+                today_customer_analysis = st.session_state["today_customer_analysis"]
+                today_detail_analysis = st.session_state["today_detail_analysis"]
+                st.subheader("오늘 업로드 요약")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("원본 상품행", f"{len(raw_orders):,}행")
+                c2.metric("실제 주문", f"{len(order_preview):,}건")
+                c3.metric("예상 고객", f"{order_preview['analysis_customer_key'].nunique():,}명")
+                c4.metric("오늘 재구매", f"{int((today_customer_analysis['기존주문횟수'] >= 1).sum()) if not today_customer_analysis.empty else 0:,}명")
+                c5.metric("주의/블랙", f"{int((today_customer_analysis['블랙상태'].isin(['주의','블랙'])).sum()) if not today_customer_analysis.empty else 0:,}명")
 
-        progress = st.progress(0, text="엑셀 읽는 중...")
-        for idx, f in enumerate(uploaded_files, start=1):
-            try:
-                std, market, raw_len = parse_uploaded_file_cached(f.name, f.getvalue())
-                frames.append(std)
-                read_logs.append({
-                    "파일명": f.name,
-                    "채널": market,
-                    "원본행": raw_len,
-                    "정리행": len(std),
-                    "상태": "성공",
-                })
-            except Exception as e:
-                errors.append((f.name, str(e)))
-                read_logs.append({
-                    "파일명": f.name,
-                    "채널": "",
-                    "원본행": 0,
-                    "정리행": 0,
-                    "상태": "실패",
-                })
-            progress.progress(idx / len(uploaded_files), text=f"{idx}/{len(uploaded_files)}개 처리 중")
+                st.success("분석 완료. 위쪽의 `🔥 오늘 주문 분석` 탭에서 재구매/VIP/블랙 고객을 색상으로 확인하세요.")
 
-        progress.empty()
+                with st.expander("오늘 주문 고객 요약 바로 보기", expanded=True):
+                    if not today_customer_analysis.empty:
+                        st.dataframe(style_today_customer_table(today_customer_analysis), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("오늘 주문 분석 데이터가 없습니다.")
 
-        log_df = pd.DataFrame(read_logs)
-        success_count = int((log_df["상태"] == "성공").sum()) if not log_df.empty else 0
-        fail_count = int((log_df["상태"] == "실패").sum()) if not log_df.empty else 0
-        st.markdown(
-            f'<div class="summary-box">✅ 업로드 처리 완료: 성공 <b>{success_count:,}</b>개 / 실패 <b>{fail_count:,}</b>개</div>',
-            unsafe_allow_html=True
-        )
+                with st.expander("저장 전 주문 단위 상세 보기", expanded=False):
+                    st.dataframe(order_preview.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
 
-        with st.expander("파일별 처리 상세 보기", expanded=False):
-            if not log_df.empty:
-                st.dataframe(log_df, use_container_width=True, hide_index=True)
+                col_save, col_clear = st.columns([1, 1])
+                with col_save:
+                    if st.button("DB에 저장하기", type="primary", use_container_width=True):
+                        saved = upsert_orders(order_preview)
+                        st.success(f"{saved:,}건 저장 완료. 대량 자료는 1000건씩 시도하고, 실패 시 자동으로 더 작게 나눠 저장했습니다. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
+                        st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
+                with col_clear:
+                    if st.button("화면 분석 결과 초기화", use_container_width=True):
+                        st.session_state["today_raw_orders"] = pd.DataFrame()
+                        st.session_state["today_order_preview"] = pd.DataFrame()
+                        st.session_state["today_customer_analysis"] = pd.DataFrame()
+                        st.session_state["today_detail_analysis"] = pd.DataFrame()
+                        st.session_state.pop("_upload_analysis_signature_v21", None)
+                        st.session_state["_upload_widget_version_v21"] = st.session_state.get("_upload_widget_version_v21", 0) + 1
+                        st.rerun()
+        elif not st.session_state.get("today_raw_orders", pd.DataFrame()).empty:
+            st.info("✅ 이전 업로드 분석이 이번 로그인 세션에 남아 있어요. 오늘 주문 분석·재고관리 탭에서 계속 사용할 수 있습니다. 새 파일을 올리면 갱신됩니다.")
 
-        for name, msg in errors:
-            st.error(f"{name}: {msg}")
-
-        if frames:
-            raw_orders = pd.concat(frames, ignore_index=True)
-            order_preview = make_order_level(raw_orders, use_strict=False)
-
-            # 기존 DB와 비교한 오늘 주문 분석을 세션에 저장
-            orders_db_current = fetch_orders_as_order_level()
-            customer_df_current = make_customer_df(orders_db_current) if not orders_db_current.empty else pd.DataFrame()
-            black_df_current = fetch_blacklist()
-            today_customer_analysis, today_detail_analysis = analyze_today_orders(
-                order_preview, orders_db_current, customer_df_current, black_df_current
-            )
-            st.session_state["today_raw_orders"] = raw_orders
-            st.session_state["today_order_preview"] = order_preview
-            st.session_state["today_customer_analysis"] = today_customer_analysis
-            st.session_state["today_detail_analysis"] = today_detail_analysis
-
-            st.subheader("오늘 업로드 요약")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("원본 상품행", f"{len(raw_orders):,}행")
-            c2.metric("실제 주문", f"{len(order_preview):,}건")
-            c3.metric("예상 고객", f"{order_preview['analysis_customer_key'].nunique():,}명")
-            c4.metric("오늘 재구매", f"{int((today_customer_analysis['기존주문횟수'] >= 1).sum()) if not today_customer_analysis.empty else 0:,}명")
-            c5.metric("주의/블랙", f"{int((today_customer_analysis['블랙상태'].isin(['주의','블랙'])).sum()) if not today_customer_analysis.empty else 0:,}명")
-
-            st.success("분석 완료. 위쪽의 `🔥 오늘 주문 분석` 탭에서 재구매/VIP/블랙 고객을 색상으로 확인하세요.")
-
-            with st.expander("오늘 주문 고객 요약 바로 보기", expanded=True):
-                if not today_customer_analysis.empty:
-                    st.dataframe(style_today_customer_table(today_customer_analysis), use_container_width=True, hide_index=True)
-                else:
-                    st.info("오늘 주문 분석 데이터가 없습니다.")
-
-            with st.expander("저장 전 주문 단위 상세 보기", expanded=False):
-                st.dataframe(order_preview.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
-
-            col_save, col_clear = st.columns([1, 1])
-            with col_save:
-                if st.button("DB에 저장하기", type="primary", use_container_width=True):
-                    saved = upsert_orders(order_preview)
-                    st.success(f"{saved:,}건 저장 완료. 대량 자료는 1000건씩 시도하고, 실패 시 자동으로 더 작게 나눠 저장했습니다. 기존 주문번호는 자동으로 중복 제거/갱신되었습니다.")
-                    st.info("저장 후 대시보드/고객 CRM 탭을 새로고침하면 누적 DB 기준으로 반영됩니다.")
-            with col_clear:
-                if st.button("화면 분석 결과 초기화", use_container_width=True):
-                    st.session_state["today_raw_orders"] = pd.DataFrame()
-                    st.session_state["today_order_preview"] = pd.DataFrame()
-                    st.session_state["today_customer_analysis"] = pd.DataFrame()
-                    st.session_state["today_detail_analysis"] = pd.DataFrame()
-                    st.rerun()
-
-# DB 데이터 로드
-orders_db = fetch_orders_as_order_level()
-black_df = fetch_blacklist()
-
-if orders_db.empty:
-    with tab_dashboard:
-        st.info("아직 저장된 주문 DB가 없습니다. 먼저 엑셀을 업로드하고 DB에 저장하세요.")
+# 업로드 탭을 보고 있을 때는 다른 탭의 1만 건 이상 DB/차트 분석을 실행하지 않는다.
+# 파일을 올린 경우 신규·재구매 분석에 필요한 주문 DB만 위쪽에서 별도로 확인한다.
+if tab_upload.open:
     st.stop()
 
-customer_df = make_customer_df(orders_db)
+# DB 데이터 로드: 선택한 화면에 필요한 자료만 조회한다.
+orders_db = fetch_orders_as_order_level()
+black_df = (fetch_blacklist() if any(t.open for t in
+            (tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_download))
+            else pd.DataFrame())
 
-if not black_df.empty:
-    customer_df = customer_df.merge(
-        black_df[["customer_key", "status", "reason", "memo", "incident_date", "result"]],
-        left_on="analysis_customer_key",
-        right_on="customer_key",
-        how="left"
-    )
+if orders_db.empty:
+    if tab_dashboard.open:
+        with tab_dashboard:
+            st.info("아직 저장된 주문 DB가 없습니다. 먼저 엑셀을 업로드하고 DB에 저장하세요.")
+    st.stop()
+
+needs_customer_profile = any(t.open for t in (tab_dashboard, tab_customers, tab_detail, tab_vip, tab_ai, tab_black, tab_download))
+if needs_customer_profile:
+    customer_df = make_customer_df(orders_db)
+
+    if not black_df.empty:
+        customer_df = customer_df.merge(
+            black_df[["customer_key", "status", "reason", "memo", "incident_date", "result"]],
+            left_on="analysis_customer_key",
+            right_on="customer_key",
+            how="left"
+        )
+    else:
+        customer_df["status"] = ""
+        customer_df["reason"] = ""
+        customer_df["memo"] = ""
+        customer_df["incident_date"] = ""
+        customer_df["result"] = ""
+
+    customer_df["black_status"] = customer_df["status"].fillna("정상").replace("", "정상")
+    customer_df["총주문금액"] = customer_df["total_amount"]
+    customer_df["건당평균금액"] = customer_df["avg_order_amount"]
+
 else:
-    customer_df["status"] = ""
-    customer_df["reason"] = ""
-    customer_df["memo"] = ""
-    customer_df["incident_date"] = ""
-    customer_df["result"] = ""
+    customer_df = pd.DataFrame()
 
-customer_df["black_status"] = customer_df["status"].fillna("정상").replace("", "정상")
-customer_df["총주문금액"] = customer_df["total_amount"]
-customer_df["건당평균금액"] = customer_df["avg_order_amount"]
-
-
-with tab_inventory:
-    render_inventory(
-        raw_orders=st.session_state.get("today_raw_orders", pd.DataFrame()),
-        orders_db=orders_db,
-        shipping_summary_func=make_shipping_summary,
-        infer_shipping_item=infer_shipping_item,
-    )
+if tab_inventory.open:
+    with tab_inventory:
+        render_inventory(
+            raw_orders=st.session_state.get("today_raw_orders", pd.DataFrame()),
+            orders_db=orders_db,
+            shipping_summary_func=make_shipping_summary,
+            infer_shipping_item=infer_shipping_item,
+        )
 
 
-with tab_today:
-    st.subheader("🔥 오늘 주문 분석")
-    st.caption("엑셀 업로드 후 DB 저장 전에도 기존 DB와 비교해서 오늘 주문 고객이 신규인지 재구매인지 바로 확인합니다.")
+if tab_today.open:
+    with tab_today:
+        st.subheader("🔥 오늘 주문 분석")
+        st.caption("엑셀 업로드 후 DB 저장 전에도 기존 DB와 비교해서 오늘 주문 고객이 신규인지 재구매인지 바로 확인합니다.")
 
-    today_customer_analysis = st.session_state.get("today_customer_analysis", pd.DataFrame())
-    today_detail_analysis = st.session_state.get("today_detail_analysis", pd.DataFrame())
+        today_customer_analysis = st.session_state.get("today_customer_analysis", pd.DataFrame())
+        today_detail_analysis = st.session_state.get("today_detail_analysis", pd.DataFrame())
 
-    if today_customer_analysis is None or today_customer_analysis.empty:
-        st.info("먼저 `엑셀 업로드` 탭에서 오늘 쿠팡/네이버 엑셀을 업로드하세요.")
-    else:
-        total_today_customers = len(today_customer_analysis)
-        reorder_count = int((today_customer_analysis["기존주문횟수"] >= 1).sum())
-        new_count = int((today_customer_analysis["기존주문횟수"] == 0).sum())
-        vip_reorder_count = int(today_customer_analysis["오늘고객상태"].astype(str).str.contains("VIP").sum())
-        black_today_count = int(today_customer_analysis["블랙상태"].isin(["주의", "블랙"]).sum())
-
-        a, b, c, d, e = st.columns(5)
-        a.metric("오늘 고객", f"{total_today_customers:,}명")
-        b.metric("오늘 신규", f"{new_count:,}명")
-        c.metric("오늘 재구매", f"{reorder_count:,}명")
-        d.metric("VIP 재주문", f"{vip_reorder_count:,}명")
-        e.metric("주의/블랙", f"{black_today_count:,}명")
-
-        st.markdown("""
-        - ⚪ 신규: 기존 DB에 없던 고객
-        - 🟢 재주문: 기존 주문 이력이 있는 고객
-        - 🟡 VIP 재주문: 기존 5회 이상 구매 고객
-        - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
-        - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
-        """)
-
-        st.subheader("📦 오늘 출고 총합")
-        today_raw_orders = st.session_state.get("today_raw_orders", pd.DataFrame())
-        shipping_summary = make_shipping_summary(today_raw_orders)
-
-        if shipping_summary.empty:
-            st.info("오늘 업로드된 주문이 없습니다.")
+        if today_customer_analysis is None or today_customer_analysis.empty:
+            st.info("먼저 `엑셀 업로드` 탭에서 오늘 쿠팡/네이버 엑셀을 업로드하세요.")
         else:
-            st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
+            total_today_customers = len(today_customer_analysis)
+            reorder_count = int((today_customer_analysis["기존주문횟수"] >= 1).sum())
+            new_count = int((today_customer_analysis["기존주문횟수"] == 0).sum())
+            vip_reorder_count = int(today_customer_analysis["오늘고객상태"].astype(str).str.contains("VIP").sum())
+            black_today_count = int(today_customer_analysis["블랙상태"].isin(["주의", "블랙"]).sum())
 
-        with st.expander("주별 출고량 / 품목별 주간 평균", expanded=False):
-            weekly_table, weekly_avg = make_weekly_shipping_table_from_orders(today_raw_orders)
+            a, b, c, d, e = st.columns(5)
+            a.metric("오늘 고객", f"{total_today_customers:,}명")
+            b.metric("오늘 신규", f"{new_count:,}명")
+            c.metric("오늘 재구매", f"{reorder_count:,}명")
+            d.metric("VIP 재주문", f"{vip_reorder_count:,}명")
+            e.metric("주의/블랙", f"{black_today_count:,}명")
 
-            st.markdown("**업로드 파일 기준 주별 출고량**")
-            if weekly_table.empty:
-                st.info("주별 출고량 데이터가 없습니다.")
+            st.markdown("""
+            - ⚪ 신규: 기존 DB에 없던 고객
+            - 🟢 재주문: 기존 주문 이력이 있는 고객
+            - 🟡 VIP 재주문: 기존 5회 이상 구매 고객
+            - 🔵 복귀 재주문: 90일 이상 미구매 후 재주문
+            - 🔴 주의/블랙: 블랙리스트 또는 주의 고객
+            """)
+
+            st.subheader("📦 오늘 출고 총합")
+            today_raw_orders = st.session_state.get("today_raw_orders", pd.DataFrame())
+            shipping_summary = make_shipping_summary(today_raw_orders)
+
+            if shipping_summary.empty:
+                st.info("오늘 업로드된 주문이 없습니다.")
             else:
-                st.dataframe(weekly_table, use_container_width=True, hide_index=True)
+                st.dataframe(shipping_summary, use_container_width=True, hide_index=True)
 
-            st.markdown("**품목별 주간 평균 출고량**")
-            if weekly_avg.empty:
-                st.info("품목별 주간 평균 데이터가 없습니다.")
+            with st.expander("주별 출고량 / 품목별 주간 평균", expanded=False):
+                weekly_table, weekly_avg = make_weekly_shipping_table_from_orders(today_raw_orders)
+
+                st.markdown("**업로드 파일 기준 주별 출고량**")
+                if weekly_table.empty:
+                    st.info("주별 출고량 데이터가 없습니다.")
+                else:
+                    st.dataframe(weekly_table, use_container_width=True, hide_index=True)
+
+                st.markdown("**품목별 주간 평균 출고량**")
+                if weekly_avg.empty:
+                    st.info("품목별 주간 평균 데이터가 없습니다.")
+                else:
+                    st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
+
+            with st.expander("저장 DB 기준 최근 N주 평균 출고량 (기존 주문 단위 추정)", expanded=False):
+                st.warning("기존 주문 DB는 원본 상품행이 없어 혼합 주문의 실제 병 수량을 정확히 복원할 수 없습니다. 생산량 판단에는 새 재고관리 탭의 기록을 사용하세요.")
+                avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
+                weekly_avg_db = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
+                if weekly_avg_db.empty:
+                    st.info("주간 평균 출고량 데이터가 없습니다.")
+                else:
+                    st.dataframe(weekly_avg_db, use_container_width=True, hide_index=True)
+
+            filter_status = st.multiselect(
+                "상태 필터",
+                options=sorted(today_customer_analysis["오늘고객상태"].unique()),
+                default=sorted(today_customer_analysis["오늘고객상태"].unique()),
+            )
+
+            view_today = today_customer_analysis[today_customer_analysis["오늘고객상태"].isin(filter_status)]
+            st.dataframe(style_today_customer_table(view_today), use_container_width=True, hide_index=True, height=420)
+
+            st.subheader("고객별 역대 주문내역 보기")
+            selected_customer = st.selectbox(
+                "고객 선택",
+                options=view_today["고객키"].tolist(),
+                format_func=lambda k: view_today.loc[view_today["고객키"] == k, "오늘고객명"].iloc[0] + " | " + str(view_today.loc[view_today["고객키"] == k, "오늘고객상태"].iloc[0])
+            )
+
+            history = orders_db[orders_db["analysis_customer_key"] == selected_customer].sort_values("order_date", ascending=False)
+            st.write("기존 DB 저장 주문내역")
+            if history.empty:
+                st.info("기존 주문내역 없음. 이번 주문이 첫 주문입니다.")
             else:
-                st.dataframe(weekly_avg, use_container_width=True, hide_index=True)
+                st.dataframe(history, use_container_width=True, hide_index=True)
 
-        with st.expander("저장 DB 기준 최근 N주 평균 출고량 (기존 주문 단위 추정)", expanded=False):
-            st.warning("기존 주문 DB는 원본 상품행이 없어 혼합 주문의 실제 병 수량을 정확히 복원할 수 없습니다. 생산량 판단에는 새 재고관리 탭의 기록을 사용하세요.")
-            avg_weeks = st.slider("분석 기간", min_value=2, max_value=26, value=8, step=1)
-            weekly_avg_db = make_weekly_shipping_average(orders_db, weeks=avg_weeks)
-            if weekly_avg_db.empty:
-                st.info("주간 평균 출고량 데이터가 없습니다.")
-            else:
-                st.dataframe(weekly_avg_db, use_container_width=True, hide_index=True)
+            if today_detail_analysis is not None and not today_detail_analysis.empty:
+                st.write("이번 업로드 주문 상세")
+                today_detail_customer = today_detail_analysis[today_detail_analysis["analysis_customer_key"] == selected_customer]
+                st.dataframe(today_detail_customer, use_container_width=True, hide_index=True)
 
-        filter_status = st.multiselect(
-            "상태 필터",
-            options=sorted(today_customer_analysis["오늘고객상태"].unique()),
-            default=sorted(today_customer_analysis["오늘고객상태"].unique()),
-        )
 
-        view_today = today_customer_analysis[today_customer_analysis["오늘고객상태"].isin(filter_status)]
-        st.dataframe(style_today_customer_table(view_today), use_container_width=True, hide_index=True, height=420)
 
-        st.subheader("고객별 역대 주문내역 보기")
-        selected_customer = st.selectbox(
-            "고객 선택",
-            options=view_today["고객키"].tolist(),
-            format_func=lambda k: view_today.loc[view_today["고객키"] == k, "오늘고객명"].iloc[0] + " | " + str(view_today.loc[view_today["고객키"] == k, "오늘고객상태"].iloc[0])
-        )
 
-        history = orders_db[orders_db["analysis_customer_key"] == selected_customer].sort_values("order_date", ascending=False)
-        st.write("기존 DB 저장 주문내역")
-        if history.empty:
-            st.info("기존 주문내역 없음. 이번 주문이 첫 주문입니다.")
+# =========================
+# V20 경영 대시보드: 기존 DB를 읽기만 하는 순수 계산 함수
+# =========================
+@st.cache_data(ttl=180, max_entries=4, show_spinner=False)
+def _v20_orders(orders):
+    """주문 시각은 KST 기준 날짜로만 집계; 주문건수와 병 수량을 혼동하지 않음."""
+    if orders is None or orders.empty or "order_date" not in orders.columns:
+        return pd.DataFrame(columns=["local_day", "month", "weekday", "channel", "analysis_customer_key"])
+    fields = [c for c in ["order_date", "channel", "analysis_customer_key", "receiver_name", "buyer_name"] if c in orders.columns]
+    d = orders[fields].copy()
+    parsed = pd.to_datetime(d["order_date"], errors="coerce", utc=True)
+    d = d.loc[parsed.notna()].copy()
+    parsed = parsed.loc[parsed.notna()]
+    d["local_day"] = parsed.dt.tz_convert(KST).dt.date
+    d["month"] = parsed.dt.tz_convert(KST).dt.strftime("%Y-%m")
+    d["weekday"] = parsed.dt.tz_convert(KST).dt.weekday
+    d["channel"] = d.get("channel", pd.Series("기타", index=d.index)).fillna("기타").astype(str).map(
+        lambda x: "쿠팡" if "쿠팡" in x else ("네이버" if "네이버" in x else "기타"))
+    d["analysis_customer_key"] = d.get("analysis_customer_key", pd.Series("", index=d.index)).fillna("").astype(str)
+    return d
+
+
+def _v20_period_count(sales, start_day, end_day):
+    return int(sales["local_day"].between(start_day, end_day).sum()) if not sales.empty else 0
+
+
+def _v20_compare(sales, days, today):
+    # 오늘은 아직 진행 중이므로 어제까지 완료된 날짜만 사용
+    end = today - timedelta(days=1)
+    cur = _v20_period_count(sales, end - timedelta(days=days-1), end)
+    prev = _v20_period_count(sales, end - timedelta(days=2*days-1), end - timedelta(days=days))
+    pct = (cur - prev) / prev * 100 if prev > 0 else None
+    return cur, prev, pct
+
+
+@st.cache_data(ttl=180, max_entries=4, show_spinner=False)
+def _v20_repurchase(sales, today):
+    """구매 간격(동일 날짜 복수 주문 제외), 60일 재구매 전환율(관찰기간 확보 코호트)."""
+    result = {"intervals": [], "median": None, "eligible": 0, "converted": 0,
+              "churn": pd.DataFrame(columns=["고객", "구매횟수", "마지막 구매", "평소 간격(일)", "경과(일)", "지연 정도"])}
+    if sales.empty:
+        return result
+    eligible, converted, intervals, churn_rows = 0, 0, [], []
+    named = "receiver_name" if "receiver_name" in sales else ("buyer_name" if "buyer_name" in sales else None)
+    for key, group in sales[sales["analysis_customer_key"].str.len() > 0].groupby("analysis_customer_key", sort=False):
+        days = sorted(group["local_day"].dropna().unique())
+        if not days:
+            continue
+        if days[0] <= today-timedelta(days=60):
+            eligible += 1
+            if len(days) >= 2 and (days[1]-days[0]).days <= 60:
+                converted += 1
+        if len(days) < 2:
+            continue
+        gaps = [(y-x).days for x, y in zip(days[:-1], days[1:]) if (y-x).days > 0]
+        intervals.extend(gaps)
+        if gaps:
+            normal = float(pd.Series(gaps).median())
+            elapsed = (today-days[-1]).days
+            # 2회 이상 구매한 고객만; 본인 구매주기의 2배 이상 지연 + 최소 45일
+            if elapsed >= max(45, 2*normal):
+                customer_name = "고객"
+                if named:
+                    nonempty = group[named].dropna().astype(str)
+                    nonempty = nonempty[nonempty.str.strip() != ""]
+                    if not nonempty.empty:
+                        customer_name = nonempty.iloc[-1]
+                churn_rows.append({"고객": customer_name, "구매횟수": len(group),
+                                   "마지막 구매": days[-1].isoformat(), "평소 간격(일)": round(normal),
+                                   "경과(일)": elapsed, "지연 정도": round(elapsed/max(1,normal),1)})
+    result["intervals"] = intervals
+    result["median"] = float(pd.Series(intervals).median()) if intervals else None
+    result["eligible"] = eligible
+    result["converted"] = converted
+    if churn_rows:
+        result["churn"] = pd.DataFrame(churn_rows).sort_values("지연 정도", ascending=False).reset_index(drop=True)
+    return result
+
+
+def _v20_complete_weeks(inventory_rows, today, lookback=4):
+    """오늘 포함 주는 제외; 5품목×월~금 모두 최종 저장된 주만 평균에 사용."""
+    calendar = _recorded_inventory_calendar(inventory_rows)
+    monday = today-timedelta(days=today.weekday())
+    completed = []
+    for i in range(lookback, 0, -1):
+        info = _week_snapshot(calendar, monday-timedelta(weeks=i))
+        if info["complete_days"] == 5:
+            completed.append(info)
+    return completed
+
+
+def _v20_latest_stock(inventory_rows, today):
+    found = {}
+    for row in inventory_rows:
+        try:
+            day = date.fromisoformat(str(row.get("inventory_date", ""))[:10])
+            key = row.get("item_key")
+            if key not in KEYS or day > today:
+                continue
+            if key not in found or day > found[key][0]:
+                found[key] = (day, _safe_int(row.get("closing_qty")))
+        except (ValueError, TypeError):
+            continue
+    return found
+
+
+def _v20_production(inventory_rows, today, min_weeks=2):
+    completed = _v20_complete_weeks(inventory_rows, today, 4)
+    stock = _v20_latest_stock(inventory_rows, today)
+    report = []
+    for key, label, threshold, inclusive in ITEMS:
+        weeks = [w["items"][key]["total"] for w in completed]
+        weekly_mean = sum(weeks)/len(weeks) if weeks else None
+        record = stock.get(key)
+        qty = record[1] if record else None
+        freshness = (today-record[0]).days if record else None
+        usable = len(weeks) >= min_weeks and qty is not None and freshness is not None and freshness <= 7
+        # 필요량 = 다음 주 평일 예상 출고량 + 안전재고 기준 - 최신 재고
+        safe_target = threshold + (1 if inclusive else 0)
+        recommended = max(0, int(math.ceil(weekly_mean + safe_target - qty))) if usable else None
+        expected_days = (qty / (weekly_mean/5)) if usable and weekly_mean and weekly_mean>0 else None
+        report.append({"품목": label,
+                       "최신 재고": qty if qty is not None else "—",
+                       "재고 확인일": record[0].isoformat() if record else "—",
+                       "최근 4주 확보": f"{len(weeks)}/4주",
+                       "주간 예상 출고": round(weekly_mean) if len(weeks)>=min_weeks else "—",
+                       "소진 예상(영업일)": round(expected_days,1) if expected_days is not None else "—",
+                       "생산 참고량": recommended if recommended is not None else "—",
+                       "기준": ("참고치" if usable else "기록 부족/재고 갱신 필요")})
+    return pd.DataFrame(report), len(completed)
+
+
+def _v20_holiday(sales, event_current, event_previous, today):
+    """명절 날짜를 기준으로 D-21~D-1 세 구간을 비교. 주문건수로만 표시."""
+    rows = []
+    for first in ("3주 전", "2주 전", "1주 전"):
+        index = {"3주 전":(21,15), "2주 전":(14,8), "1주 전":(7,1)}[first]
+        prev_start = event_previous-timedelta(days=index[0])
+        prev_end = event_previous-timedelta(days=index[1])
+        cur_start = event_current-timedelta(days=index[0])
+        cur_end = event_current-timedelta(days=index[1])
+        old = _v20_period_count(sales, prev_start, prev_end)
+        new = _v20_period_count(sales, cur_start, min(cur_end,today-timedelta(days=1))) if cur_start < today else 0
+        complete = cur_end < today
+        rows.append({"기간": first, f"{event_previous.year} 주문": old,
+                     f"{event_current.year} 주문": new if complete else None,
+                     "비교": (f"{(new-old)/old:+.1%}" if complete and old else "비교 불가")})
+    return pd.DataFrame(rows)
+
+
+def _v20_big_chart(chart, height=320, key=None, selectable=False):
+    chart = chart.properties(height=height).configure_axis(
+        labelFontSize=16, titleFontSize=17, labelPadding=10, titlePadding=12,
+        gridColor="#e8eef5").configure_legend(labelFontSize=16, titleFontSize=16).configure_view(strokeWidth=0)
+    kwargs={"use_container_width":True}
+    if selectable:
+        kwargs.update({"key":key,"on_select":"rerun"})
+    return st.altair_chart(chart, **kwargs)
+
+
+def _v20_delta(pct):
+    return f"{pct:+.1f}%" if pct is not None else "이전 기간 0건"
+
+
+if tab_dashboard.open:
+    with tab_dashboard:
+        today_v20 = datetime.now(KST).date()
+        sales_v20 = _v20_orders(orders_db)
+        total_orders = len(sales_v20)
+        total_customers = len(customer_df)
+        repeat_customers = int((customer_df["order_count"] >= 2).sum())
+        repeat_rate = 100 * repeat_customers / total_customers if total_customers else 0
+        first_time = total_customers-repeat_customers
+        vip_count = int((customer_df["order_count"] >= 5).sum())
+        week_now, week_prev, week_change = _v20_compare(sales_v20,7,today_v20)
+        month_now, month_prev, month_change = _v20_compare(sales_v20,30,today_v20)
+
+        st.title("📊 식혜명가 경영 대시보드")
+        st.caption("기존 주문 DB와 확정 저장한 출고 기록 기준 · 주문건수와 출고 병수는 구분 표시 · 오늘 진행 중 주문은 기간 비교에서 제외")
+        c1,c2,c3 = st.columns(3)
+        c1.metric("누적 주문", f"{total_orders:,}건")
+        c2.metric("전체 고객", f"{total_customers:,}명")
+        c3.metric("누적 재구매 고객 비중", f"{repeat_rate:.1f}%", help="전체 고객 중 주문 2회 이상인 고객 비중. 첫 구매 후 60일 재구매 전환율과 다릅니다.")
+        c4,c5,c6 = st.columns(3)
+        c4.metric("최근 7일 주문", f"{week_now:,}건", delta=_v20_delta(week_change), delta_color="off" if week_change is None else "normal")
+        c5.metric("최근 30일 주문", f"{month_now:,}건", delta=_v20_delta(month_change), delta_color="off" if month_change is None else "normal")
+        c6.metric("VIP 고객 (5회 이상)", f"{vip_count:,}명")
+        st.caption("최근 7·30일 증감률은 각각 직전 동일 일수와 비교합니다. 판매 채널, 요일, 명절 효과는 상세 화면에서 확인하세요.")
+        latest_day = max(sales_v20["local_day"]) if not sales_v20.empty else None
+        if latest_day is not None and (today_v20-latest_day).days > 7:
+            st.warning(f"⚠️ 마지막 주문 데이터가 {latest_day:%Y-%m-%d}입니다. 최근 주문 엑셀을 DB에 저장하지 않았다면 판매 추이가 실제 상황과 다를 수 있습니다.")
+        if week_change is not None and week_prev>=10 and week_change < -20:
+            st.warning(f"📉 최근 7일 주문이 직전 7일 대비 {abs(week_change):.1f}% 감소했습니다. 채널별 변화를 확인해 주세요.")
+
+        st.markdown("""<style>
+            .vg-tooltip, #vg-tooltip-element, #vg-tooltip-element table {font-size:18px !important;line-height:1.6!important;}
+            .vg-tooltip td,.vg-tooltip th{font-size:17px!important;padding:7px 12px!important;}
+            div[data-testid="stAltairChart"]{min-height:280px;}
+            </style>""", unsafe_allow_html=True)
+        panels=st.tabs(["📈 판매 흐름", "👥 고객·재구매", "🏭 생산·재고", "🛒 채널·명절"], on_change="rerun", key="crm_dashboard_panels")
+
+        if panels[0].open:
+            with panels[0]:
+                st.subheader("월별 주문 흐름")
+                period_choice = st.segmented_control("표시 기간", ["최근 12개월", "최근 24개월", "연도별 전체"], default="최근 12개월", key="v20_period")
+                monthly=sales_v20.groupby("month").size().rename("orders").reset_index().sort_values("month")
+                if not monthly.empty:
+                    span=pd.period_range(monthly["month"].iloc[0], monthly["month"].iloc[-1],freq="M")
+                    monthly=pd.DataFrame({"month":span.astype(str)}).merge(monthly,on="month",how="left").fillna({"orders":0})
+                    monthly["orders"]=monthly["orders"].astype(int)
+                    if period_choice=="최근 12개월":
+                        visible=monthly.tail(12).copy()
+                    elif period_choice=="최근 24개월":
+                        visible=monthly.tail(24).copy()
+                    else:
+                        years=sorted(monthly["month"].str[:4].unique(),reverse=True)
+                        yr=st.selectbox("조회 연도",years,key="v20_month_year")
+                        visible=monthly[monthly["month"].str.startswith(yr)].copy()
+                    visible["3개월 평균"]=visible["orders"].rolling(3,min_periods=1).mean().round(1)
+                    visible["짧은 월"]=visible["month"].str[5:7].astype(int).astype(str)+"월"
+                    # 클릭한 막대의 수치를 차트 아래에 큰 글씨로 표시한다.
+                    selection=alt.selection_point(name="month_pick",fields=["month"],on="click",clear="dblclick")
+                    bars=alt.Chart(visible).mark_bar(cornerRadiusTopLeft=4,cornerRadiusTopRight=4).encode(
+                        x=alt.X("month:N",sort=list(visible["month"]),title=None,
+                                axis=alt.Axis(labelFontSize=16,labelAngle=-25, labelOverlap=False,
+                                              labelExpr="substring(datum.label,2,4) + '.' + substring(datum.label,5,7)")),
+                        y=alt.Y("orders:Q",title="주문 건수",axis=alt.Axis(tickMinStep=1)),
+                        color=alt.condition(selection,alt.value("#1d4ed8"),alt.value("#60a5fa")),
+                        tooltip=[alt.Tooltip("month:N",title="월"),alt.Tooltip("orders:Q",title="주문 건수",format=",d"),
+                                 alt.Tooltip("3개월 평균:Q",title="3개월 평균",format=".1f")]
+                    ).add_params(selection)
+                    state=_v20_big_chart(bars,330,key="v20_month_chart",selectable=True)
+                    chosen=None
+                    try:
+                        selected=state.selection.get("month_pick",[])
+                        if selected and isinstance(selected,list):
+                            chosen=selected[0].get("month")
+                    except (AttributeError,KeyError,TypeError,IndexError):
+                        pass
+                    if chosen not in set(visible["month"]):
+                        chosen=visible["month"].iloc[-1]
+                    count=int(visible.loc[visible["month"]==chosen,"orders"].iloc[0])
+                    st.metric(f"선택 월 · {chosen}",f"{count:,}건")
+                    st.caption("막대를 한 번 클릭하면 해당 월 주문량을 크게 표시합니다. 더블클릭하면 선택이 초기화됩니다. 월은 한국시간 기준.")
+                    with st.expander("월별 주문 수치 표 보기",expanded=False):
+                        st.dataframe(visible[["month","orders","3개월 평균"]].rename(columns={"month":"월","orders":"주문 건수"}),use_container_width=True,hide_index=True)
+                else:
+                    st.info("월별 주문 기록이 없습니다.")
+                st.divider()
+                st.subheader("월~일 요일별 주문 패턴")
+                anchor=today_v20-timedelta(days=today_v20.weekday())
+                start=anchor-timedelta(weeks=8)
+                window=sales_v20[sales_v20["local_day"].between(start,anchor-timedelta(days=1))]
+                day_counts=window.groupby("weekday").size().to_dict()
+                weekday_names=["월","화","수","목","금","토","일"]
+                pattern=pd.DataFrame({"요일":weekday_names,"주문 평균":[round(day_counts.get(i,0)/8,1) for i in range(7)]})
+                day_chart=alt.Chart(pattern).mark_bar(size=38,cornerRadiusEnd=4).encode(
+                    x=alt.X("요일:N",sort=weekday_names,title=None), y=alt.Y("주문 평균:Q",title="하루 평균 주문(건)"),
+                    tooltip=[alt.Tooltip("요일:N"),alt.Tooltip("주문 평균:Q",format=".1f")],color=alt.value("#2563eb"))
+                _v20_big_chart(day_chart,265)
+                st.caption(f"직전 완료된 8주 ({start:%Y-%m-%d} ~ {(anchor-timedelta(days=1)):%Y-%m-%d})의 주문일 기준 요일당 평균. 출고요일과 다를 수 있습니다.")
+
+        if panels[1].open:
+            with panels[1]:
+                customer_repeat = _v20_repurchase(sales_v20, today_v20)
+                st.subheader("재구매 실적")
+                col_a,col_b,col_c=st.columns(3)
+                col_a.metric("재구매 고객",f"{repeat_customers:,}명")
+                col_b.metric("구매 간격 중앙값",f"{customer_repeat['median']:.0f}일" if customer_repeat['median'] is not None else "기록 부족")
+                ratio=customer_repeat['converted']/customer_repeat['eligible']*100 if customer_repeat['eligible'] else None
+                col_c.metric("첫 구매 60일 내 재구매",f"{ratio:.1f}%" if ratio is not None else "기록 부족")
+                st.caption(f"60일 전까지 처음 구매한 고객 {customer_repeat['eligible']:,}명 중 60일 안에 다시 산 비율. 구매 간격은 같은 날 여러 주문을 제외한 서로 다른 구매일 기준.")
+                bins=[("1~7일",1,7),("8~30일",8,30),("31~60일",31,60),("61~90일",61,90),("91일 이상",91,10000000)]
+                gaps=customer_repeat['intervals']
+                if gaps:
+                    hist=pd.DataFrame({"기간":[x[0] for x in bins],"재구매 간격 수":[sum(lo<=g<=hi for g in gaps) for _,lo,hi in bins]})
+                    c=alt.Chart(hist).mark_bar(size=26).encode(
+                        y=alt.Y("기간:N",sort=[x[0] for x in bins],title=None),
+                        x=alt.X("재구매 간격 수:Q",title="구매 간격 사례 수"),tooltip=["기간:N",alt.Tooltip("재구매 간격 수:Q",format=",d")],
+                        color=alt.value("#2563eb"))
+                    _v20_big_chart(c,270)
+                st.divider()
+                st.subheader("이탈 위험: 평소보다 구매가 늦어진 단골")
+                churn_df=customer_repeat['churn']
+                st.metric("지연 후보",f"{len(churn_df):,}명")
+                st.caption("서로 다른 날짜에 2번 이상 구매했고, 마지막 구매 후 45일 이상이면서 본인 구매 간격 중앙값의 2배 이상 경과한 경우. 확정 이탈이 아닌 관리 참고 명단입니다.")
+                with st.expander("지연 고객 목록 보기 (관리자 전용)", expanded=False):
+                    if churn_df.empty:
+                        st.info("해당 조건의 고객이 없습니다.")
+                    else:
+                        st.dataframe(churn_df.head(50),use_container_width=True,hide_index=True)
+                        st.caption("고객명만 표시하며 전화번호와 주소는 제외했습니다. 고객 CRM 탭에서 상세 확인 가능. 연락 전에 수신 동의 확인이 필요합니다.")
+                st.divider()
+                st.subheader("고객 구매횟수별 분포")
+                customer_oc=pd.to_numeric(customer_df['order_count'],errors='coerce').fillna(0)
+                buckets=[("1회",int((customer_oc==1).sum())),("2회",int((customer_oc==2).sum())),
+                         ("3회",int((customer_oc==3).sum())),("4회",int((customer_oc==4).sum())),
+                         ("5회 이상",int((customer_oc>=5).sum()))]
+                bucket_df=pd.DataFrame(buckets,columns=["구매횟수","고객수"])
+                b=alt.Chart(bucket_df).mark_bar(size=30,cornerRadiusEnd=4).encode(
+                    y=alt.Y("구매횟수:N",sort=[x[0] for x in buckets],title=None),
+                    x=alt.X("고객수:Q",title="고객 수"),
+                    tooltip=["구매횟수:N",alt.Tooltip("고객수:Q",format=",d")],color=alt.value("#f59e0b"))
+                _v20_big_chart(b,270)
+
+        if panels[2].open:
+            with panels[2]:
+                st.subheader("다음 주 생산량 참고")
+                st.caption("여기서는 **매일 '재고관리 → 오늘 재고 최종 저장'**한 실제 출고 병 수량만 사용합니다. 원본 주문 DB의 주문 건수를 병수로 대체하지 않습니다.")
+                inventory_history, inv_error=fetch_inventory_rows()
+                if inv_error:
+                    st.warning(inv_error)
+                else:
+                    production_df, finished=_v20_production(inventory_history,today_v20)
+                    st.metric("최근 4주 중 완전히 기록한 평일 주간",f"{finished}/4주")
+                    st.dataframe(production_df,use_container_width=True,hide_index=True)
+                    st.caption("생산 참고량 = 다음 주 평일 예상 출고 + 품목별 최소 보유기준 − 최근 저장 재고. **최근 완료 4주 중 최소 2주**의 월~금 모두 기록되고 재고가 7일 이내 갱신된 경우만 계산합니다. 0개 출고와 미기록을 구분합니다.")
+                    if finished < 2:
+                        st.info("현재는 실제 출고 기록이 부족해 생산량을 임의 예측하지 않습니다. 평일 5일을 하루도 빠짐없이 2주 이상 저장하면 수치가 나타납니다.")
+                    stale=production_df[production_df['기준']!='참고치']
+                    if not stale.empty and finished>=2:
+                        st.warning("일부 품목의 재고 기록이 오래됐거나 누락됐습니다. 생산 추천 전에 재고를 확인·저장해 주세요.")
+                    st.divider()
+                    st.subheader("품목별 재고 소진 위험")
+                    st.caption("소진 예상일은 판매·주말·휴무 변동이 반영되지 않은 단순 **영업일 환산 참고치**입니다. 품목별 부족 기준은 재고관리 설정과 동일합니다.")
+                    if not production_df.empty:
+                        chart_data=production_df[pd.to_numeric(production_df['소진 예상(영업일)'],errors='coerce').notna()].copy()
+                        if not chart_data.empty:
+                            chart_data['일수']=pd.to_numeric(chart_data['소진 예상(영업일)'])
+                            dchart=alt.Chart(chart_data).mark_bar(size=26).encode(
+                                y=alt.Y('품목:N',sort=[p[1] for p in ITEMS],title=None),
+                                x=alt.X('일수:Q',title='예상 영업일'),color=alt.value('#f59e0b'),
+                                tooltip=['품목:N',alt.Tooltip('일수:Q',format='.1f')])
+                            _v20_big_chart(dchart,270)
+                        else:
+                            st.info("재고 소진 분석에 필요한 실제 출고 기록이 쌓이면 여기 표시됩니다.")
+
+        if panels[3].open:
+            with panels[3]:
+                st.subheader("쿠팡 vs 네이버")
+                channel_summary=sales_v20.groupby('channel',dropna=False).agg(
+                    주문건수=('channel','size'),고객수=('analysis_customer_key','nunique')).reset_index().rename(columns={'channel':'채널'})
+                channel_summary=channel_summary[channel_summary['채널'].isin(['쿠팡','네이버','기타'])]
+                st.dataframe(channel_summary,use_container_width=True,hide_index=True)
+                st.caption("채널별 주문 건수와 해당 채널에 구매 기록이 있는 고유 고객 수입니다. 두 채널 모두 구매한 고객은 각 채널에서 한 번씩 집계될 수 있습니다.")
+                end_month=today_v20.strftime('%Y-%m')
+                recent_periods=pd.period_range(end=pd.Period(end_month,freq='M'),periods=6,freq='M').astype(str).tolist()
+                channel_recent=sales_v20[sales_v20['month'].isin(recent_periods)]
+                grouped=channel_recent.groupby(['month','channel']).size().rename('주문 건수').reset_index()
+                frame=pd.MultiIndex.from_product([recent_periods,['쿠팡','네이버']],names=['month','channel']).to_frame(index=False)
+                grouped=frame.merge(grouped,on=['month','channel'],how='left').fillna({'주문 건수':0})
+                chart=alt.Chart(grouped).mark_bar().encode(
+                    x=alt.X('month:N',sort=recent_periods,title=None,axis=alt.Axis(labelAngle=-20)),
+                    y=alt.Y('주문 건수:Q',title='주문 건수',stack=None),
+                    color=alt.Color('channel:N',title='판매 채널',scale=alt.Scale(domain=['쿠팡','네이버'],range=['#2563eb','#16a34a'])),
+                    xOffset='channel:N',tooltip=['month:N','channel:N',alt.Tooltip('주문 건수:Q',format=',.0f')])
+                _v20_big_chart(chart,300)
+                if '기타' in set(sales_v20['channel']):
+                    st.warning("일부 주문의 채널을 쿠팡 또는 네이버로 분류하지 못해 '기타'로 집계했습니다. 주문 원본의 채널명을 확인해 주세요.")
+                st.divider()
+                st.subheader("명절 주문 수요 · 명절 날짜에 맞춰 비교")
+                holiday=st.segmented_control('명절',options=['추석','설날'],default='추석',key='v20_holiday')
+                presets={'추석':(date(2026,9,25),date(2025,10,6)), '설날':(date(2026,2,17),date(2025,1,29))}
+                current_default,previous_default=presets[holiday]
+                p1,p2=st.columns(2)
+                with p1:
+                    event_current=st.date_input('비교 연도 명절 당일',value=current_default,key=f'v20_holiday_current_{holiday}')
+                with p2:
+                    event_previous=st.date_input('이전 연도 명절 당일',value=previous_default,key=f'v20_holiday_prev_{holiday}')
+                holidays=_v20_holiday(sales_v20,event_current,event_previous,today_v20)
+                st.dataframe(holidays,use_container_width=True,hide_index=True)
+                st.caption("각 명절 당일의 D-21~D-1을 7일씩 나눠 **주문 건수**로 비교합니다. 날짜를 직접 바꿀 수 있으며, 명절 당일·이후 주문과 배송 휴무일은 포함하지 않습니다.")
+                st.info("⚠️ 명절 분석의 '주문 건수'를 그대로 식혜 병 수량으로 환산하지 않습니다. 정확한 명절 생산량은 앞으로 누적될 실제 출고 기록과 함께 판단해야 합니다.")
+
+        with st.expander("🤖 CRM AI 요약 (선택 실행)",expanded=False):
+            ai_ready=ai_status_line()
+            if st.button('✨ 현재 CRM 자동 분석',type='primary',key='dashboard_ai_run_v20',disabled=not ai_ready):
+                with st.spinner('고객 개인정보를 제외한 집계 수치 분석 중...'):
+                    st.session_state['dashboard_ai_result_v20']=auto_ai_crm_analysis(customer_df,orders_db)
+            if st.session_state.get('dashboard_ai_result_v20'):
+                st.markdown(st.session_state['dashboard_ai_result_v20'])
+
+if tab_customers.open:
+    with tab_customers:
+        st.subheader("👤 고객 CRM")
+        st.caption("이름/전화번호/주소/상품명으로 검색하고, VIP·재구매·블랙 고객을 색상으로 확인합니다.")
+
+        search = st.text_input("통합 검색", placeholder="예: 고객명, 전화번호, 주소, 상품명")
+        grade_options = sorted(customer_df["grade"].dropna().unique())
+        selected_grades = st.multiselect("고객등급", grade_options, default=grade_options)
+
+        black_options = sorted(customer_df["black_status"].dropna().unique())
+        selected_black = st.multiselect("블랙상태", black_options, default=black_options)
+
+        view = customer_df[
+            (customer_df["grade"].isin(selected_grades)) &
+            (customer_df["black_status"].isin(selected_black))
+        ].copy()
+
+        if search:
+            search_mask = (
+                view["customer_name"].astype(str).str.contains(search, case=False, na=False, regex=False)
+                | view["phone"].astype(str).str.contains(search, case=False, na=False, regex=False)
+                | view["address"].astype(str).str.contains(search, case=False, na=False, regex=False)
+                | view["products"].astype(str).str.contains(search, case=False, na=False, regex=False)
+            )
+            view = view[search_mask]
+
+        sort_col = st.selectbox("정렬", ["order_count", "total_amount", "last_order_date", "avg_order_amount"], index=0)
+        view = view.sort_values(sort_col, ascending=False)
+
+        show_cols = [
+            "customer_name", "phone", "address", "grade", "black_status",
+            "order_count", "total_amount", "avg_order_amount",
+            "first_order_date", "last_order_date", "channels", "products"
+        ]
+        show_cols = [c for c in show_cols if c in view.columns]
+
+        st.dataframe(style_customer_crm_table(view[show_cols]), use_container_width=True, hide_index=True, height=520)
+
+        st.markdown("### 고객 CRM 구매이력 바로 확인")
+        if view.empty:
+            st.info("검색 결과가 없습니다.")
         else:
-            st.dataframe(history, use_container_width=True, hide_index=True)
+            history_options = view.copy()
+            history_options["history_label"] = (
+                history_options["customer_name"].astype(str)
+                + " | "
+                + history_options["phone"].astype(str)
+                + " | "
+                + history_options["order_count"].astype(str)
+                + "회"
+            )
 
-        if today_detail_analysis is not None and not today_detail_analysis.empty:
-            st.write("이번 업로드 주문 상세")
-            today_detail_customer = today_detail_analysis[today_detail_analysis["analysis_customer_key"] == selected_customer]
-            st.dataframe(today_detail_customer, use_container_width=True, hide_index=True)
+            selected_history_label = st.selectbox("구매이력 확인할 고객 선택", history_options["history_label"].tolist())
+            selected_history = history_options[history_options["history_label"] == selected_history_label].iloc[0]
+            selected_key = selected_history["analysis_customer_key"]
+
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("주문횟수", f"{int(selected_history['order_count']):,}회")
+            h2.metric("총 주문금액", f"{int(selected_history.get('total_amount', 0)):,}원")
+            h3.metric("건당 평균금액", f"{int(selected_history.get('avg_order_amount', 0)):,}원")
+            h4.metric("최근 주문일", str(pd.to_datetime(selected_history["last_order_date"]).date()))
+
+            notes_df = fetch_customer_notes()
+            memo_text = ""
+            if not notes_df.empty and selected_key in notes_df["customer_key"].astype(str).values:
+                memo_text = notes_df[notes_df["customer_key"].astype(str) == str(selected_key)]["memo"].iloc[0]
+            if memo_text:
+                st.markdown(f"**고객 메모**  \n{memo_text}")
+
+            history_df = orders_db[orders_db["analysis_customer_key"] == selected_key].sort_values("order_date", ascending=False)
+            st.dataframe(history_df, use_container_width=True, hide_index=True, height=300)
 
 
 
-with tab_dashboard:
-    st.subheader("📊 고객·주문 대시보드")
-    st.caption("저장된 CRM 데이터 기준 · 고객의 구매횟수는 누적 주문횟수로 계산")
+if tab_detail.open:
+    with tab_detail:
+        st.subheader("🔎 고객 상세")
+        st.caption("고객을 선택하면 주문횟수, 첫/최근 주문일, 전체 주문내역, 고객 메모를 볼 수 있습니다.")
 
-    total_orders = len(orders_db)
-    total_customers = len(customer_df)
-    repeat_customers = int((customer_df["order_count"] >= 2).sum())
-    repeat_rate = repeat_customers / total_customers * 100 if total_customers else 0
-    one_time_customers = int((customer_df["order_count"] == 1).sum())
-    vip_count = int((customer_df["order_count"] >= 5).sum())
-    black_count = int((customer_df["black_status"].isin(["주의", "블랙"])).sum())
-
-    # 큰 카드 여섯 개를 3개씩 두 줄에 배치해 좁은 화면에서도 수치가 명확하게 읽히도록.
-    k1, k2, k3 = st.columns(3)
-    k1.metric("누적 주문", f"{total_orders:,}건")
-    k2.metric("누적 고객", f"{total_customers:,}명")
-    k3.metric("재구매율", f"{repeat_rate:.1f}%")
-    k4, k5, k6 = st.columns(3)
-    k4.metric("1회 구매 고객", f"{one_time_customers:,}명")
-    k5.metric("재구매 고객 (2회 이상)", f"{repeat_customers:,}명")
-    k6.metric("VIP (5회 이상)", f"{vip_count:,}명")
-    if black_count:
-        st.caption(f"⚠️ 주의/블랙 지정 고객: {black_count:,}명 · 자세한 내용은 블랙리스트 탭에서 확인")
-
-    st.divider()
-    st.markdown("#### 📈 월별 주문 흐름")
-    selected_months = st.segmented_control(
-        "표시 기간", options=["최근 12개월", "최근 24개월", "전체"],
-        default="최근 12개월", key="dashboard_month_window",
-    )
-    monthly = orders_db[["order_date"]].copy()
-    monthly["order_date"] = pd.to_datetime(monthly["order_date"], errors="coerce", utc=True)
-    monthly = monthly.dropna(subset=["order_date"])
-    monthly["month"] = monthly["order_date"].dt.strftime("%Y-%m")
-    counts = monthly.groupby("month").size().rename("orders").reset_index().sort_values("month")
-    if not counts.empty:
-        # 데이터가 없는 중간 월도 0건으로 표시해 흐름 왜곡 방지
-        month_period = pd.period_range(counts["month"].iloc[0], counts["month"].iloc[-1], freq="M")
-        counts = (pd.DataFrame({"month": month_period.astype(str)})
-                  .merge(counts, on="month", how="left").fillna({"orders": 0}))
-        counts["orders"] = counts["orders"].astype(int)
-        if selected_months != "전체":
-            n = 12 if selected_months == "최근 12개월" else 24
-            counts = counts.tail(n)
-        counts["3개월 평균"] = counts["orders"].rolling(3, min_periods=1).mean().round(1)
-        latest_orders = int(counts["orders"].iloc[-1])
-        # 사용자 스크린샷의 현재 달은 아직 진행 중이므로 수치를 확정 비교하지 않음
-        st.caption(f"조회 기간: {counts['month'].iloc[0]} ~ {counts['month'].iloc[-1]} · 마지막 달 {latest_orders:,}건 (진행 중인 월일 수 있음)")
-        bars = alt.Chart(counts).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
-            x=alt.X("month:N", sort=list(counts["month"]), title=None,
-                    axis=alt.Axis(labelAngle=-40, labelOverlap=False, labelFontSize=11)),
-            y=alt.Y("orders:Q", title="주문 건수", axis=alt.Axis(tickMinStep=1)),
-            tooltip=[alt.Tooltip("month:N", title="월"), alt.Tooltip("orders:Q", title="주문", format=",d"),
-                     alt.Tooltip("3개월 평균:Q", title="3개월 이동평균", format=".1f")],
-            color=alt.value("#2563eb"),
-        )
-        st.altair_chart(bars.properties(height=265), use_container_width=True)
-    else:
-        st.info("월별 주문 날짜를 확인할 수 없습니다.")
-
-    st.divider()
-    left, right = st.columns([1.6, 1], gap="large")
-    with left:
-        st.markdown("#### 👥 구매횟수별 고객")
-        st.caption("가로 막대로 표시해 '1회' 등의 글자가 잘리지 않도록 개선")
-        cats = ["1회", "2회", "3회", "4회", "5회 이상"]
-        oc = pd.to_numeric(customer_df["order_count"], errors="coerce").fillna(0)
-        bucket_df = pd.DataFrame({"구매횟수": cats, "고객수": [
-            int((oc == 1).sum()), int((oc == 2).sum()), int((oc == 3).sum()),
-            int((oc == 4).sum()), int((oc >= 5).sum()),
-        ]})
-        max_customers = max(1, int(bucket_df["고객수"].max()))
-        chart = alt.Chart(bucket_df).mark_bar(cornerRadiusEnd=4, size=24).encode(
-            y=alt.Y("구매횟수:N", sort=cats, title=None,
-                    axis=alt.Axis(labelAngle=0, labelFontSize=13, labelPadding=10)),
-            x=alt.X("고객수:Q", title="고객 수", scale=alt.Scale(domain=[0, max_customers * 1.22]),
-                    axis=alt.Axis(format=",d", tickCount=4)),
-            color=alt.condition(alt.datum["구매횟수"] == "1회", alt.value("#f59e0b"), alt.value("#2563eb")),
-            tooltip=[alt.Tooltip("구매횟수:N"), alt.Tooltip("고객수:Q", format=",d")],
-        )
-        labels = alt.Chart(bucket_df).mark_text(align="left", baseline="middle", dx=8, fontSize=13, fontWeight="bold").encode(
-            y=alt.Y("구매횟수:N", sort=cats), x="고객수:Q", text=alt.Text("고객수:Q", format=",d"))
-        st.altair_chart((chart + labels).properties(height=240), use_container_width=True)
-    with right:
-        st.markdown("#### 🔍 고객 구조 한눈에")
-        first_rate = 100 - repeat_rate if total_customers else 0
-        st.metric("1회 구매 비중", f"{first_rate:.1f}%")
-        st.progress(min(1.0, max(0.0, first_rate / 100)))
-        st.caption("재구매 유도 대상 고객의 규모를 파악할 수 있어요.")
-        st.metric("VIP 비중", f"{vip_count / total_customers * 100:.1f}%" if total_customers else "0.0%")
-        st.caption("VIP = 누적 5회 이상 구매 고객")
-
-    st.divider()
-    st.markdown("#### 🤖 CRM AI 분석")
-    ai_ready = ai_status_line()
-    if st.button("✨ 현재 CRM 자동 분석", type="primary", key="dashboard_ai_run_v19", disabled=not ai_ready):
-        with st.spinner("집계 데이터를 바탕으로 분석 중..."):
-            st.session_state["dashboard_ai_result_v19"] = auto_ai_crm_analysis(customer_df, orders_db)
-    if st.session_state.get("dashboard_ai_result_v19"):
-        st.markdown(st.session_state["dashboard_ai_result_v19"])
-
-with tab_customers:
-    st.subheader("👤 고객 CRM")
-    st.caption("이름/전화번호/주소/상품명으로 검색하고, VIP·재구매·블랙 고객을 색상으로 확인합니다.")
-
-    search = st.text_input("통합 검색", placeholder="예: 고객명, 전화번호, 주소, 상품명")
-    grade_options = sorted(customer_df["grade"].dropna().unique())
-    selected_grades = st.multiselect("고객등급", grade_options, default=grade_options)
-
-    black_options = sorted(customer_df["black_status"].dropna().unique())
-    selected_black = st.multiselect("블랙상태", black_options, default=black_options)
-
-    view = customer_df[
-        (customer_df["grade"].isin(selected_grades)) &
-        (customer_df["black_status"].isin(selected_black))
-    ].copy()
-
-    if search:
-        search_mask = (
-            view["customer_name"].astype(str).str.contains(search, case=False, na=False)
-            | view["phone"].astype(str).str.contains(search, case=False, na=False)
-            | view["address"].astype(str).str.contains(search, case=False, na=False)
-            | view["products"].astype(str).str.contains(search, case=False, na=False)
-        )
-        view = view[search_mask]
-
-    sort_col = st.selectbox("정렬", ["order_count", "total_amount", "last_order_date", "avg_order_amount"], index=0)
-    view = view.sort_values(sort_col, ascending=False)
-
-    show_cols = [
-        "customer_name", "phone", "address", "grade", "black_status",
-        "order_count", "total_amount", "avg_order_amount",
-        "first_order_date", "last_order_date", "channels", "products"
-    ]
-    show_cols = [c for c in show_cols if c in view.columns]
-
-    st.dataframe(style_customer_crm_table(view[show_cols]), use_container_width=True, hide_index=True, height=520)
-
-    st.markdown("### 고객 CRM 구매이력 바로 확인")
-    if view.empty:
-        st.info("검색 결과가 없습니다.")
-    else:
-        history_options = view.copy()
-        history_options["history_label"] = (
-            history_options["customer_name"].astype(str)
+        customer_view = customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]).copy()
+        customer_view["label"] = (
+            customer_view["customer_name"].astype(str)
             + " | "
-            + history_options["phone"].astype(str)
+            + customer_view["phone"].astype(str)
             + " | "
-            + history_options["order_count"].astype(str)
+            + customer_view["order_count"].astype(str)
             + "회"
         )
 
-        selected_history_label = st.selectbox("구매이력 확인할 고객 선택", history_options["history_label"].tolist())
-        selected_history = history_options[history_options["history_label"] == selected_history_label].iloc[0]
-        selected_key = selected_history["analysis_customer_key"]
+        keyword = st.text_input("이름/전화번호/주소 검색")
+        if keyword:
+            mask = (
+                customer_view["customer_name"].astype(str).str.contains(keyword, case=False, na=False, regex=False)
+                | customer_view["phone"].astype(str).str.contains(keyword, case=False, na=False, regex=False)
+                | customer_view["address"].astype(str).str.contains(keyword, case=False, na=False, regex=False)
+            )
+            customer_view = customer_view[mask]
 
-        h1, h2, h3, h4 = st.columns(4)
-        h1.metric("주문횟수", f"{int(selected_history['order_count']):,}회")
-        h2.metric("총 주문금액", f"{int(selected_history.get('total_amount', 0)):,}원")
-        h3.metric("건당 평균금액", f"{int(selected_history.get('avg_order_amount', 0)):,}원")
-        h4.metric("최근 주문일", str(pd.to_datetime(selected_history["last_order_date"]).date()))
+        if customer_view.empty:
+            st.info("검색 결과가 없습니다.")
+        else:
+            selected_label = st.selectbox("고객 선택", customer_view["label"].tolist())
+            selected = customer_view[customer_view["label"] == selected_label].iloc[0]
+            key = selected["analysis_customer_key"]
 
-        notes_df = fetch_customer_notes()
-        memo_text = ""
-        if not notes_df.empty and selected_key in notes_df["customer_key"].astype(str).values:
-            memo_text = notes_df[notes_df["customer_key"].astype(str) == str(selected_key)]["memo"].iloc[0]
-        if memo_text:
-            st.markdown(f"**고객 메모**  \n{memo_text}")
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("주문횟수", f"{int(selected['order_count']):,}회")
+            c2.metric("등급", str(selected["grade"]))
+            c3.metric("총 주문금액", f"{int(selected.get('total_amount', 0)):,}원")
+            c4.metric("건당 평균금액", f"{int(selected.get('avg_order_amount', 0)):,}원")
+            c5.metric("첫 주문일", str(pd.to_datetime(selected["first_order_date"]).date()))
+            c6.metric("최근 주문일", str(pd.to_datetime(selected["last_order_date"]).date()))
 
-        history_df = orders_db[orders_db["analysis_customer_key"] == selected_key].sort_values("order_date", ascending=False)
-        st.dataframe(history_df, use_container_width=True, hide_index=True, height=300)
+            st.write("고객정보")
+            info_df = pd.DataFrame([{
+                "고객명": selected["customer_name"],
+                "전화번호": selected["phone"],
+                "주소": selected["address"],
+                "이용채널": selected["channels"],
+                "구매상품": selected["products"],
+            }])
+            st.dataframe(info_df, use_container_width=True, hide_index=True)
+
+            st.write("고객 메모 / 태그")
+            notes_df = fetch_customer_notes()
+            old_memo = ""
+            if not notes_df.empty and key in notes_df["customer_key"].astype(str).values:
+                old_memo = notes_df[notes_df["customer_key"].astype(str) == str(key)]["memo"].iloc[0]
+
+            tag_options = [
+                "단호박매니아", "식혜매니아", "혼합구매", "대량주문", "소량주문",
+                "신규", "재구매", "VIP", "VVIP",
+                "쿠폰반응", "행사반응", "선물용", "재구매유도",
+                "CS주의", "배송주의", "블랙",
+                "회사구매", "학교구매", "단체구매"
+            ]
+            selected_tags = st.multiselect("고객 태그", tag_options)
+            memo_input = st.text_area("메모 입력", value=old_memo, placeholder="예: 단호박 선호 / 행사 대량주문 / CS 주의")
+            save_text = "[태그] " + ", ".join(selected_tags) + "\n" + memo_input if selected_tags else memo_input
+
+            if st.button("고객 메모 저장", type="primary"):
+                save_customer_note(key, selected["customer_name"], selected["phone"], selected["address"], save_text)
+                st.success("고객 메모 저장 완료")
+
+            st.write("전체 주문내역")
+            history = orders_db[orders_db["analysis_customer_key"] == key].sort_values("order_date", ascending=False)
+            st.dataframe(history, use_container_width=True, hide_index=True)
+
+
+if tab_vip.open:
+    with tab_vip:
+        st.subheader("⭐ VIP 고객")
+        st.caption("기본 5회 이상, 필요하면 기준을 바꿔 확인할 수 있습니다.")
+
+        vip_min = st.slider("VIP 기준 주문횟수", min_value=2, max_value=20, value=5, step=1)
+        vip_df = customer_df[customer_df["order_count"] >= vip_min].sort_values(["order_count", "last_order_date"], ascending=[False, False])
+
+        a, b = st.columns(2)
+        a.metric("VIP 고객수", f"{len(vip_df):,}명")
+        b.metric("최고 주문횟수", f"{int(vip_df['order_count'].max()) if not vip_df.empty else 0:,}회")
+
+        st.dataframe(vip_df, use_container_width=True, hide_index=True)
 
 
 
-with tab_detail:
-    st.subheader("🔎 고객 상세")
-    st.caption("고객을 선택하면 주문횟수, 첫/최근 주문일, 전체 주문내역, 고객 메모를 볼 수 있습니다.")
+if tab_ai.open:
+    with tab_ai:
+        st.subheader("🤖 AI CRM 비서")
+        st.caption("고객 개인정보는 보내지 않고 누적 주문·재구매율·구매횟수 등 집계만 전송합니다.")
+        ai_ready = ai_status_line()
+        if not ai_ready:
+            st.code('AI_PROVIDER = "gemini"\nGEMINI_API_KEY = "실제 API 키"\nGEMINI_MODEL = "gemini-3.5-flash-lite"', language="toml")
+            st.caption("설정 경로: Streamlit Cloud → 앱 → Settings → Secrets · 비밀키는 채팅에 보내지 마세요.")
 
-    customer_view = customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]).copy()
-    customer_view["label"] = (
-        customer_view["customer_name"].astype(str)
-        + " | "
-        + customer_view["phone"].astype(str)
-        + " | "
-        + customer_view["order_count"].astype(str)
-        + "회"
-    )
+        st.markdown("### 🚀 자동 CRM 분석")
+        if st.button("✨ 자동 CRM 분석 실행", type="primary", use_container_width=True,
+                     key="ai_tab_auto_v19", disabled=not ai_ready):
+            with st.spinner("집계 데이터를 분석 중입니다..."):
+                st.session_state["ai_tab_auto_result_v19"] = auto_ai_crm_analysis(customer_df, orders_db)
+        if st.session_state.get("ai_tab_auto_result_v19"):
+            st.markdown(st.session_state["ai_tab_auto_result_v19"])
 
-    keyword = st.text_input("이름/전화번호/주소 검색")
-    if keyword:
-        mask = (
-            customer_view["customer_name"].astype(str).str.contains(keyword, case=False, na=False)
-            | customer_view["phone"].astype(str).str.contains(keyword, case=False, na=False)
-            | customer_view["address"].astype(str).str.contains(keyword, case=False, na=False)
+        st.divider()
+        st.markdown("### 💬 직접 질문")
+        quick_q = st.selectbox("빠른 질문", [
+            "현재 CRM 상태를 짧게 분석해줘",
+            "재구매율을 높이려면 뭘 하면 좋을까?",
+            "VIP 고객 관리 전략을 추천해줘",
+            "오늘 주문 분석 결과에서 주의할 점을 알려줘",
+            "마케팅 문자 보낼 고객 기준을 추천해줘",
+            "2회 구매 고객을 3회 구매로 전환하는 방법을 알려줘",
+            "VIP 고객에게 보낼 문자 문구를 작성해줘",
+        ])
+        custom_q = st.text_area("직접 질문", placeholder="예: 3회 이상 구매고객에게 어떤 이벤트를 하면 좋을까?")
+        question = custom_q.strip() if custom_q.strip() else quick_q
+        if st.button("AI에게 질문하기", use_container_width=True,
+                     key="ai_tab_question_v19", disabled=not ai_ready):
+            with st.spinner("분석 중입니다..."):
+                st.session_state["ai_tab_question_result_v19"] = ask_ai_crm(question, customer_df, orders_db)
+        if st.session_state.get("ai_tab_question_result_v19"):
+            st.markdown(st.session_state["ai_tab_question_result_v19"])
+
+if tab_black.open:
+    with tab_black:
+        st.subheader("블랙리스트 / 주의고객 관리")
+
+        customer_options = customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]).copy()
+        customer_options["label"] = (
+            customer_options["customer_name"].astype(str)
+            + " | "
+            + customer_options["phone"].astype(str)
+            + " | "
+            + customer_options["address"].astype(str).str[:40]
         )
-        customer_view = customer_view[mask]
 
-    if customer_view.empty:
-        st.info("검색 결과가 없습니다.")
-    else:
-        selected_label = st.selectbox("고객 선택", customer_view["label"].tolist())
-        selected = customer_view[customer_view["label"] == selected_label].iloc[0]
-        key = selected["analysis_customer_key"]
+        selected_label = st.selectbox("고객 선택", customer_options["label"].tolist())
+        selected = customer_options[customer_options["label"] == selected_label].iloc[0]
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("주문횟수", f"{int(selected['order_count']):,}회")
-        c2.metric("등급", str(selected["grade"]))
-        c3.metric("총 주문금액", f"{int(selected.get('total_amount', 0)):,}원")
-        c4.metric("건당 평균금액", f"{int(selected.get('avg_order_amount', 0)):,}원")
-        c5.metric("첫 주문일", str(pd.to_datetime(selected["first_order_date"]).date()))
-        c6.metric("최근 주문일", str(pd.to_datetime(selected["last_order_date"]).date()))
+        with st.form("black_form"):
+            status = st.selectbox("상태", ["정상", "주의", "블랙"], index=0)
+            reason = st.selectbox("사유", ["", "반복 환불 요구", "허위 클레임", "배송 트집", "폭언/욕설", "고의 반품", "기타"])
+            incident_date = st.date_input("발생일", value=date.today())
+            result = st.text_input("처리 결과", placeholder="예: 재배송함 / 환불함 / 다음 주문 시 확인")
+            memo = st.text_area("상세 기록", placeholder="어떤 문제가 있었는지 기록")
+            submitted = st.form_submit_button("저장")
 
-        st.write("고객정보")
-        info_df = pd.DataFrame([{
-            "고객명": selected["customer_name"],
-            "전화번호": selected["phone"],
-            "주소": selected["address"],
-            "이용채널": selected["channels"],
-            "구매상품": selected["products"],
-        }])
-        st.dataframe(info_df, use_container_width=True, hide_index=True)
+        if submitted:
+            row = {
+                "customer_key": str(selected["analysis_customer_key"]),
+                "customer_name": str(selected["customer_name"]),
+                "phone": str(selected["phone"]),
+                "address": str(selected["address"]),
+                "status": status,
+                "reason": reason,
+                "memo": memo,
+                "incident_date": str(incident_date),
+                "result": result,
+            }
+            save_blacklist(row)
+            st.success("블랙리스트 기록 저장 완료. 새로고침하면 반영됩니다.")
 
-        st.write("고객 메모 / 태그")
-        notes_df = fetch_customer_notes()
-        old_memo = ""
-        if not notes_df.empty and key in notes_df["customer_key"].astype(str).values:
-            old_memo = notes_df[notes_df["customer_key"].astype(str) == str(key)]["memo"].iloc[0]
+        st.subheader("현재 블랙리스트")
+        st.dataframe(black_df.sort_values("updated_at", ascending=False) if "updated_at" in black_df.columns else black_df, use_container_width=True, hide_index=True)
 
-        tag_options = [
-            "단호박매니아", "식혜매니아", "혼합구매", "대량주문", "소량주문",
-            "신규", "재구매", "VIP", "VVIP",
-            "쿠폰반응", "행사반응", "선물용", "재구매유도",
-            "CS주의", "배송주의", "블랙",
-            "회사구매", "학교구매", "단체구매"
-        ]
-        selected_tags = st.multiselect("고객 태그", tag_options)
-        memo_input = st.text_area("메모 입력", value=old_memo, placeholder="예: 단호박 선호 / 행사 대량주문 / CS 주의")
-        save_text = "[태그] " + ", ".join(selected_tags) + "\n" + memo_input if selected_tags else memo_input
+        if not black_df.empty:
+            delete_key = st.selectbox("삭제할 기록 선택", black_df["customer_key"].tolist())
+            if st.button("선택 기록 삭제"):
+                delete_blacklist(delete_key)
+                st.success("삭제 완료. 새로고침하면 반영됩니다.")
 
-        if st.button("고객 메모 저장", type="primary"):
-            save_customer_note(key, selected["customer_name"], selected["phone"], selected["address"], save_text)
-            st.success("고객 메모 저장 완료")
+if tab_orders.open:
+    with tab_orders:
+        st.subheader("저장된 주문 DB")
+        st.dataframe(orders_db.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
 
-        st.write("전체 주문내역")
-        history = orders_db[orders_db["analysis_customer_key"] == key].sort_values("order_date", ascending=False)
-        st.dataframe(history, use_container_width=True, hide_index=True)
+if tab_download.open:
+    with tab_download:
+        st.subheader("엑셀 다운로드")
 
+        vip = customer_df[customer_df["order_count"] >= 5].copy()
+        repeat = customer_df[customer_df["order_count"] >= 2].copy()
+        churn_risk = customer_df[customer_df["days_since_last_order"] >= 90].copy()
+        black_customers = customer_df[customer_df["black_status"].isin(["주의", "블랙"])].copy()
 
-with tab_vip:
-    st.subheader("⭐ VIP 고객")
-    st.caption("기본 5회 이상, 필요하면 기준을 바꿔 확인할 수 있습니다.")
+        summary = pd.DataFrame({
+            "항목": ["누적 주문", "누적 고객", "재구매 고객", "재구매율", "VIP", "주의/블랙"],
+            "값": [len(orders_db), len(customer_df), len(repeat), f"{100 * len(repeat) / len(customer_df) if len(customer_df) else 0:.1f}%", len(vip), len(black_customers)]
+        })
 
-    vip_min = st.slider("VIP 기준 주문횟수", min_value=2, max_value=20, value=5, step=1)
-    vip_df = customer_df[customer_df["order_count"] >= vip_min].sort_values(["order_count", "last_order_date"], ascending=[False, False])
-
-    a, b = st.columns(2)
-    a.metric("VIP 고객수", f"{len(vip_df):,}명")
-    b.metric("최고 주문횟수", f"{int(vip_df['order_count'].max()) if not vip_df.empty else 0:,}회")
-
-    st.dataframe(vip_df, use_container_width=True, hide_index=True)
-
-
-
-with tab_ai:
-    st.subheader("🤖 AI CRM 비서")
-    st.caption("고객 개인정보는 보내지 않고 누적 주문·재구매율·구매횟수 등 집계만 전송합니다.")
-    ai_ready = ai_status_line()
-    if not ai_ready:
-        st.code('AI_PROVIDER = "gemini"\nGEMINI_API_KEY = "실제 API 키"\nGEMINI_MODEL = "gemini-3.5-flash-lite"', language="toml")
-        st.caption("설정 경로: Streamlit Cloud → 앱 → Settings → Secrets · 비밀키는 채팅에 보내지 마세요.")
-
-    st.markdown("### 🚀 자동 CRM 분석")
-    if st.button("✨ 자동 CRM 분석 실행", type="primary", use_container_width=True,
-                 key="ai_tab_auto_v19", disabled=not ai_ready):
-        with st.spinner("집계 데이터를 분석 중입니다..."):
-            st.session_state["ai_tab_auto_result_v19"] = auto_ai_crm_analysis(customer_df, orders_db)
-    if st.session_state.get("ai_tab_auto_result_v19"):
-        st.markdown(st.session_state["ai_tab_auto_result_v19"])
-
-    st.divider()
-    st.markdown("### 💬 직접 질문")
-    quick_q = st.selectbox("빠른 질문", [
-        "현재 CRM 상태를 짧게 분석해줘",
-        "재구매율을 높이려면 뭘 하면 좋을까?",
-        "VIP 고객 관리 전략을 추천해줘",
-        "오늘 주문 분석 결과에서 주의할 점을 알려줘",
-        "마케팅 문자 보낼 고객 기준을 추천해줘",
-        "2회 구매 고객을 3회 구매로 전환하는 방법을 알려줘",
-        "VIP 고객에게 보낼 문자 문구를 작성해줘",
-    ])
-    custom_q = st.text_area("직접 질문", placeholder="예: 3회 이상 구매고객에게 어떤 이벤트를 하면 좋을까?")
-    question = custom_q.strip() if custom_q.strip() else quick_q
-    if st.button("AI에게 질문하기", use_container_width=True,
-                 key="ai_tab_question_v19", disabled=not ai_ready):
-        with st.spinner("분석 중입니다..."):
-            st.session_state["ai_tab_question_result_v19"] = ask_ai_crm(question, customer_df, orders_db)
-    if st.session_state.get("ai_tab_question_result_v19"):
-        st.markdown(st.session_state["ai_tab_question_result_v19"])
-
-with tab_black:
-    st.subheader("블랙리스트 / 주의고객 관리")
-
-    customer_options = customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]).copy()
-    customer_options["label"] = (
-        customer_options["customer_name"].astype(str)
-        + " | "
-        + customer_options["phone"].astype(str)
-        + " | "
-        + customer_options["address"].astype(str).str[:40]
-    )
-
-    selected_label = st.selectbox("고객 선택", customer_options["label"].tolist())
-    selected = customer_options[customer_options["label"] == selected_label].iloc[0]
-
-    with st.form("black_form"):
-        status = st.selectbox("상태", ["정상", "주의", "블랙"], index=0)
-        reason = st.selectbox("사유", ["", "반복 환불 요구", "허위 클레임", "배송 트집", "폭언/욕설", "고의 반품", "기타"])
-        incident_date = st.date_input("발생일", value=date.today())
-        result = st.text_input("처리 결과", placeholder="예: 재배송함 / 환불함 / 다음 주문 시 확인")
-        memo = st.text_area("상세 기록", placeholder="어떤 문제가 있었는지 기록")
-        submitted = st.form_submit_button("저장")
-
-    if submitted:
-        row = {
-            "customer_key": str(selected["analysis_customer_key"]),
-            "customer_name": str(selected["customer_name"]),
-            "phone": str(selected["phone"]),
-            "address": str(selected["address"]),
-            "status": status,
-            "reason": reason,
-            "memo": memo,
-            "incident_date": str(incident_date),
-            "result": result,
+        download_sheets = {
+            "요약": summary,
+            "고객CRM": customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]),
+            "VIP": vip,
+            "재구매": repeat,
+            "이탈위험": churn_risk,
+            "블랙리스트": black_customers,
+            "주문DB": orders_db.sort_values("order_date", ascending=False),
         }
-        save_blacklist(row)
-        st.success("블랙리스트 기록 저장 완료. 새로고침하면 반영됩니다.")
 
-    st.subheader("현재 블랙리스트")
-    st.dataframe(black_df.sort_values("updated_at", ascending=False) if "updated_at" in black_df.columns else black_df, use_container_width=True, hide_index=True)
+        today_customer_analysis = st.session_state.get("today_customer_analysis", pd.DataFrame())
+        today_detail_analysis = st.session_state.get("today_detail_analysis", pd.DataFrame())
+        if today_customer_analysis is not None and not today_customer_analysis.empty:
+            download_sheets["오늘주문분석"] = today_customer_analysis
+        if today_detail_analysis is not None and not today_detail_analysis.empty:
+            download_sheets["오늘주문상세"] = today_detail_analysis
 
-    if not black_df.empty:
-        delete_key = st.selectbox("삭제할 기록 선택", black_df["customer_key"].tolist())
-        if st.button("선택 기록 삭제"):
-            delete_blacklist(delete_key)
-            st.success("삭제 완료. 새로고침하면 반영됩니다.")
-
-with tab_orders:
-    st.subheader("저장된 주문 DB")
-    st.dataframe(orders_db.sort_values("order_date", ascending=False), use_container_width=True, hide_index=True)
-
-with tab_download:
-    st.subheader("엑셀 다운로드")
-
-    vip = customer_df[customer_df["order_count"] >= 5].copy()
-    repeat = customer_df[customer_df["order_count"] >= 2].copy()
-    churn_risk = customer_df[customer_df["days_since_last_order"] >= 90].copy()
-    black_customers = customer_df[customer_df["black_status"].isin(["주의", "블랙"])].copy()
-
-    summary = pd.DataFrame({
-        "항목": ["누적 주문", "누적 고객", "재구매 고객", "재구매율", "VIP", "주의/블랙"],
-        "값": [len(orders_db), len(customer_df), len(repeat), f"{repeat_rate:.1f}%", len(vip), len(black_customers)]
-    })
-
-    download_sheets = {
-        "요약": summary,
-        "고객CRM": customer_df.sort_values(["order_count", "last_order_date"], ascending=[False, False]),
-        "VIP": vip,
-        "재구매": repeat,
-        "이탈위험": churn_risk,
-        "블랙리스트": black_customers,
-        "주문DB": orders_db.sort_values("order_date", ascending=False),
-    }
-
-    today_customer_analysis = st.session_state.get("today_customer_analysis", pd.DataFrame())
-    today_detail_analysis = st.session_state.get("today_detail_analysis", pd.DataFrame())
-    if today_customer_analysis is not None and not today_customer_analysis.empty:
-        download_sheets["오늘주문분석"] = today_customer_analysis
-    if today_detail_analysis is not None and not today_detail_analysis.empty:
-        download_sheets["오늘주문상세"] = today_detail_analysis
-
-    excel_bytes = to_excel_bytes(download_sheets)
-
-    st.download_button(
-        "저장형 CRM 엑셀 다운로드",
-        data=excel_bytes,
-        file_name=f"sikhye_saved_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        st.caption("⚡ 엑셀 파일은 요청할 때만 생성합니다. 다른 화면에서 이동할 때는 대용량 파일 생성 작업을 실행하지 않아요.")
+        if st.button("📥 CRM 전체 엑셀 파일 만들기", type="primary", use_container_width=True, key="crm_excel_prepare_v21"):
+            with st.spinner("고객·주문 기록을 엑셀로 정리하는 중입니다..."):
+                st.session_state["_crm_excel_bytes_v21"] = to_excel_bytes(download_sheets)
+                st.session_state["_crm_excel_name_v21"] = f"sikhye_saved_crm_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        if st.session_state.get("_crm_excel_bytes_v21"):
+            st.download_button(
+                "✅ 준비된 엑셀 다운로드",
+                data=st.session_state["_crm_excel_bytes_v21"],
+                file_name=st.session_state["_crm_excel_name_v21"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
