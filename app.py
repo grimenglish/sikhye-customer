@@ -661,8 +661,79 @@ def _ship_build_completed(order_file, assignments):
     return result
 
 
+def _ship_naver_dispatch_xls(order_file, assignments):
+    """네이버 일괄발송 업로드 규격: 비암호화 BIFF8 .xls, 시트명 발송처리, 필수 4개 열.
+
+    주문파일의 상품주문번호는 문자열로 보존한다. 확인되지 않은 매칭은 출력하지 않는다.
+    """
+    try:
+        import xlwt
+    except ImportError as exc:
+        raise RuntimeError(
+            "네이버 .xls 생성 라이브러리(xlwt)가 없습니다. "
+            "GitHub의 requirements.txt에 xlwt==1.3.0을 추가하고 앱을 재시작해 주세요."
+        ) from exc
+    from openpyxl import load_workbook
+
+    source = load_workbook(io.BytesIO(order_file["data"]), read_only=True, data_only=True)
+    try:
+        ws = source.worksheets[0]
+        heading = [str(cell.value or "").strip() for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        if "상품주문번호" not in heading:
+            raise ValueError("네이버 주문 엑셀에 상품주문번호 열이 없습니다.")
+        order_col = heading.index("상품주문번호")
+        expected_rows = {row["row"] for row in order_file["records"]}
+        if expected_rows != set(assignments):
+            raise ValueError("송장번호가 모든 네이버 상품주문행에 매칭되지 않았습니다.")
+
+        result_book = xlwt.Workbook(encoding="utf-8")
+        target = result_book.add_sheet("발송처리")
+        fields = ("상품주문번호", "배송방법", "택배사", "송장번호")
+        for col, title in enumerate(fields):
+            target.write(0, col, title)
+        target.col(0).width = 24 * 256
+        target.col(1).width = 19 * 256
+        target.col(2).width = 18 * 256
+        target.col(3).width = 23 * 256
+        seen_ids = set()
+        written = 0
+        for source_row_number, cells in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if source_row_number not in expected_rows:
+                continue
+            raw_id = cells[order_col]
+            if raw_id is None:
+                raise ValueError(f"네이버 {source_row_number}행: 상품주문번호가 비어 있습니다.")
+            if isinstance(raw_id, float):
+                if not raw_id.is_integer():
+                    raise ValueError(f"네이버 {source_row_number}행: 상품주문번호 형식이 올바르지 않습니다.")
+                raw_id = int(raw_id)
+            order_id = str(raw_id).strip()
+            if not order_id.isdigit() or not (10 <= len(order_id) <= 22):
+                raise ValueError(f"네이버 {source_row_number}행: 상품주문번호를 확인해 주세요.")
+            if order_id in seen_ids:
+                raise ValueError(f"네이버 상품주문번호 {order_id}가 중복되어 저장하지 않았습니다.")
+            seen_ids.add(order_id)
+            tracking = _ship_digits(assignments[source_row_number])
+            if len(tracking) < 8 or len(tracking) > 20:
+                raise ValueError(f"네이버 {source_row_number}행: 송장번호를 확인해 주세요.")
+            row_idx = written + 1
+            for col, value in enumerate((order_id, "택배,등기,소포", "CJ대한통운", tracking)):
+                target.write(row_idx, col, value)
+            written += 1
+        if written != len(expected_rows):
+            raise RuntimeError("네이버 발송처리 파일의 행 수가 원본 주문 건수와 다릅니다.")
+        output = io.BytesIO()
+        result_book.save(output)
+        payload = output.getvalue()
+        if not payload.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+            raise RuntimeError(".xls 생성 결과가 올바른 Excel 97-2003 형식이 아닙니다.")
+        return payload
+    finally:
+        source.close()
+
+
 def make_shipment_zip(files, yyyymmdd):
-    """파일 순서 무관. 안전 매칭 성공 시 두 xlsx를 ZIP 하나로 반환."""
+    """파일 순서 무관. 네이버는 일괄발송용 xls, 쿠팡은 xlsx를 ZIP으로 반환."""
     import zipfile
     if len(files) != 4:
         raise ValueError(f"파일 4개가 필요합니다. 현재 {len(files)}개입니다.")
@@ -693,11 +764,12 @@ def make_shipment_zip(files, yyyymmdd):
         if len(assignments) != len(order["records"]):
             issues.append(f"{label}: 매칭되지 않은 주문행이 있습니다.")
         if not errs and len(assignments) == len(order["records"]):
-            built[label] = _ship_build_completed(order, assignments)
+            built[label] = (_ship_naver_dispatch_xls(order, assignments) if label == "네이버"
+                            else _ship_build_completed(order, assignments))
     if issues:
         return None, summary, issues
     output = io.BytesIO()
-    names = {"네이버": f"★네이버 완성({yyyymmdd}).xlsx", "쿠팡": f"★쿠팡 완성({yyyymmdd}).xlsx"}
+    names = {"네이버": f"★네이버 완성({yyyymmdd}).xls", "쿠팡": f"★쿠팡 완성({yyyymmdd}).xlsx"}
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for platform in ("네이버", "쿠팡"):
             archive.writestr(names[platform], built[platform])
@@ -2420,7 +2492,7 @@ _GUIDE = {
             ("🛡️", "일치 검사", "이름·전화번호·주소·상품·수량이 일치하는지 확인합니다. 불일치 시 완성 파일을 만들지 않습니다."),
             ("📦", "한 번에 다운로드", "검사에 통과하면 버튼으로 ZIP 한 개를 받아 ★네이버 완성 / ★쿠팡 완성 두 파일을 꺼냅니다."),
         ],
-        "tips": ["상단 '1행 제거' 기능과 하단 '4개 자동 매칭' 기능은 별개입니다.", "ZIP 안의 완성 엑셀을 네이버·쿠팡에 올리기 전에 송장번호와 배송행을 한 번 확인하세요.", "송장 업무 파일은 고객·주문 DB에 자동으로 저장되지 않습니다."],
+        "tips": ["상단 '1행 제거' 기능과 하단 '4개 자동 매칭' 기능은 별개입니다.", "네이버 최종 파일은 발송처리 시트와 필수 4개 열만 가진 암호 없는 .xls입니다. 네이버에 업로드한 다음 반드시 일괄 발송처리를 클릭하세요.", "ZIP 안의 송장번호를 최종 확인하세요. 파일은 고객·주문 DB에 자동 저장되지 않습니다."],
     },
     "🔥 오늘 주문 분석": {
         "intro": "오늘 올린 주문에서 신규·재구매·VIP·주의 고객과 품목별 출고를 확인합니다.",
@@ -2737,7 +2809,7 @@ with tab_shipping:
 
     st.divider()
     st.markdown("### ② 네이버 + 쿠팡 송장번호 자동 매칭")
-    st.caption("파일 4개를 **순서 상관없이 한 번에 드래그**하세요. 주문 2개 + CJ 송장 2개를 자동 구분합니다.")
+    st.caption("파일 4개를 **순서 상관없이 한 번에 드래그**하세요. 네이버 최종 파일은 암호 없는 발송처리 시트의 .xls, 쿠팡은 .xlsx로 저장됩니다.")
     st.info("📂 필요한 파일: 네이버 주문 1개 · 쿠팡 주문 1개 · 네이버 CJ 송장 1개 · 쿠팡 CJ 송장 1개")
     joined_uploads = st.file_uploader(
         "📥 주문 및 CJ 송장 엑셀 4개 동시 업로드",
@@ -2778,7 +2850,7 @@ with tab_shipping:
                         if len(problems) > 35:
                             st.caption(f"그 외 {len(problems)-35:,}건은 파일 재확인이 필요합니다.")
                 else:
-                    st.success("✅ 두 플랫폼 전부 검증 완료. 원본의 송장번호 칸만 채웠습니다.")
+                    st.success("✅ 두 플랫폼 모두 검증 완료. 네이버는 발송처리 전용 .xls(암호 없음), 쿠팡은 원본 형식 .xlsx로 만들었습니다.")
                     st.download_button(
                         "📦 ★네이버 + ★쿠팡 완성 파일 2개 한 번에 저장",
                         data=zip_bytes,
@@ -2787,7 +2859,7 @@ with tab_shipping:
                         type="primary", use_container_width=True,
                         key="ship_zip_download_v26",
                     )
-                    st.caption(f"한 번 클릭하면 ZIP이 다운로드됩니다. 압축을 풀면 **★네이버 완성({datecode}).xlsx**, **★쿠팡 완성({datecode}).xlsx** 두 파일이 나옵니다.")
+                    st.caption(f"한 번 클릭하면 ZIP이 다운로드됩니다. 압축을 풀면 **★네이버 완성({datecode}).xls**, **★쿠팡 완성({datecode}).xlsx** 두 파일이 나옵니다.")
             except Exception as exc:
                 st.session_state.pop("_ship_v26_signature", None)
                 st.session_state.pop("_ship_v26_result", None)
