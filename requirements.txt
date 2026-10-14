@@ -4,3 +4,4 @@ openpyxl
 msoffcrypto-tool
 supabase
 requests
+xlwt==1.3.0
