@@ -318,23 +318,47 @@ def safe_series(df, col, default=""):
 
 
 def read_excel_file(uploaded_file):
+    """일반 xlsx, 실제 xls, 암호화된 네이버 xlsx를 구분해 읽는다.
+
+    암호가 없는 .xls를 복호화하려 하지 않는다.
+    """
     raw = uploaded_file.getvalue()
+    name = str(getattr(uploaded_file, "name", "")).lower()
+    is_ole = raw.startswith(bytes.fromhex("D0CF11E0A1B11AE1"))
+    is_zip = raw.startswith(b"PK")
+    if not (is_ole or is_zip):
+        raise ValueError("엑셀 파일 형식이 아닙니다. 실제 .xls 또는 .xlsx 파일을 선택해 주세요.")
 
-    try:
-        return pd.read_excel(io.BytesIO(raw))
-    except Exception as first_error:
-        if msoffcrypto is None:
-            raise RuntimeError("암호화 엑셀을 읽으려면 requirements.txt 최신본이 필요합니다.")
+    if is_zip:
+        try:
+            return pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+        except Exception as exc:
+            raise ValueError(f"XLSX 파일 읽기에 실패했습니다: {exc}") from exc
 
+    # OLE 파일은 비암호화 xls일 수도 있고 암호화된 xlsx일 수도 있다.
+    # 암호화 여부를 확인하지 않고 OfficeFile.decrypt를 실행하면 오해의 소지가 있다.
+    if msoffcrypto is not None:
         try:
             office = msoffcrypto.OfficeFile(io.BytesIO(raw))
-            office.load_key(password=str(st.secrets.get("SMARTSTORE_PASSWORD", SMARTSTORE_PASSWORD)))
-            decrypted = io.BytesIO()
-            office.decrypt(decrypted)
-            decrypted.seek(0)
-            return pd.read_excel(decrypted)
-        except Exception as second_error:
-            raise RuntimeError(f"엑셀 읽기 실패: {first_error} / 암호해제 실패: {second_error}")
+            encrypted = office.is_encrypted()
+        except Exception:
+            encrypted = False
+        if encrypted:
+            try:
+                office.load_key(password=str(st.secrets.get("SMARTSTORE_PASSWORD", SMARTSTORE_PASSWORD)))
+                decrypted = io.BytesIO()
+                office.decrypt(decrypted)
+                decrypted.seek(0)
+                return pd.read_excel(decrypted, engine="openpyxl")
+            except Exception as exc:
+                raise ValueError("암호화 엑셀 해제에 실패했습니다. 네이버 원본 파일 및 암호 설정을 확인해 주세요.") from exc
+
+    try:
+        return pd.read_excel(io.BytesIO(raw), engine="xlrd")
+    except ImportError as exc:
+        raise RuntimeError("XLS(.xls) 읽기 라이브러리 xlrd가 없습니다. requirements.txt에 xlrd==2.0.2를 추가해 주세요.") from exc
+    except Exception as exc:
+        raise ValueError(f"XLS 파일을 읽을 수 없습니다. 파일이 정상적인 엑셀인지 확인해 주세요: {exc}") from exc
 
 
 
@@ -662,16 +686,17 @@ def _ship_build_completed(order_file, assignments):
 
 
 def _ship_naver_dispatch_xls(order_file, assignments):
-    """네이버 일괄발송 업로드 규격: 비암호화 BIFF8 .xls, 시트명 발송처리, 필수 4개 열.
+    """네이버 발송처리와 CRM 분석을 동시에 지원하는 비암호화 BIFF8 .xls.
 
-    주문파일의 상품주문번호는 문자열로 보존한다. 확인되지 않은 매칭은 출력하지 않는다.
+    필수 4개 열과 `발송처리` 시트 이름을 유지하되 원본 72개 열을 보존한다.
+    따라서 최종 송장 파일에서도 주문일/고객/상품/옵션/수량을 다시 분석할 수 있다.
     """
     try:
         import xlwt
     except ImportError as exc:
         raise RuntimeError(
             "네이버 .xls 생성 라이브러리(xlwt)가 없습니다. "
-            "GitHub의 requirements.txt에 xlwt==1.3.0을 추가하고 앱을 재시작해 주세요."
+            "GitHub requirements.txt에 xlwt==1.3.0을 추가해 주세요."
         ) from exc
     from openpyxl import load_workbook
 
@@ -679,61 +704,81 @@ def _ship_naver_dispatch_xls(order_file, assignments):
     try:
         ws = source.worksheets[0]
         heading = [str(cell.value or "").strip() for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-        if "상품주문번호" not in heading:
-            raise ValueError("네이버 주문 엑셀에 상품주문번호 열이 없습니다.")
-        order_col = heading.index("상품주문번호")
+        fields = ("상품주문번호", "배송방법", "택배사", "송장번호")
+        missing = [field for field in fields if field not in heading]
+        if missing:
+            raise ValueError("네이버 주문 엑셀 필수 열 누락: " + ", ".join(missing))
+        if len(heading) > 256:
+            raise ValueError("XLS 최대 256열을 초과해 주문 원본을 보존할 수 없습니다.")
+        idx = {field: heading.index(field) for field in fields}
         expected_rows = {row["row"] for row in order_file["records"]}
         if expected_rows != set(assignments):
             raise ValueError("송장번호가 모든 네이버 상품주문행에 매칭되지 않았습니다.")
+        if len(expected_rows) >= 65536:
+            raise ValueError("XLS 형식은 65,535개 주문행까지만 보존할 수 있습니다.")
 
         result_book = xlwt.Workbook(encoding="utf-8")
         target = result_book.add_sheet("발송처리")
-        fields = ("상품주문번호", "배송방법", "택배사", "송장번호")
-        for col, title in enumerate(fields):
+        date_style = xlwt.easyxf(num_format_str="YYYY-MM-DD HH:MM:SS")
+        for col, title in enumerate(heading):
             target.write(0, col, title)
-        target.col(0).width = 24 * 256
-        target.col(1).width = 19 * 256
-        target.col(2).width = 18 * 256
-        target.col(3).width = 23 * 256
-        seen_ids = set()
+            if col in idx.values():
+                target.col(col).width = min(34, max(18, len(title) * 3)) * 256
+
         written = 0
-        for source_row_number, cells in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        seen_ids = set()
+        for source_row_number, values in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
             if source_row_number not in expected_rows:
                 continue
-            raw_id = cells[order_col]
-            if raw_id is None:
-                raise ValueError(f"네이버 {source_row_number}행: 상품주문번호가 비어 있습니다.")
-            if isinstance(raw_id, float):
-                if not raw_id.is_integer():
-                    raise ValueError(f"네이버 {source_row_number}행: 상품주문번호 형식이 올바르지 않습니다.")
-                raw_id = int(raw_id)
-            order_id = str(raw_id).strip()
-            if not order_id.isdigit() or not (10 <= len(order_id) <= 22):
-                raise ValueError(f"네이버 {source_row_number}행: 상품주문번호를 확인해 주세요.")
+            cells = list(values)
+            order_id = cells[idx["상품주문번호"]]
+            if isinstance(order_id, float):
+                if not order_id.is_integer():
+                    raise ValueError(f"네이버 {source_row_number}행 상품주문번호가 유효하지 않습니다.")
+                order_id = int(order_id)
+            order_id = str(order_id or "").strip()
+            if not order_id.isdigit() or not 10 <= len(order_id) <= 22:
+                raise ValueError(f"네이버 {source_row_number}행 상품주문번호를 확인해 주세요.")
             if order_id in seen_ids:
-                raise ValueError(f"네이버 상품주문번호 {order_id}가 중복되어 저장하지 않았습니다.")
+                raise ValueError(f"상품주문번호 {order_id} 중복으로 생성을 중단했습니다.")
             seen_ids.add(order_id)
             tracking = _ship_digits(assignments[source_row_number])
-            if len(tracking) < 8 or len(tracking) > 20:
-                raise ValueError(f"네이버 {source_row_number}행: 송장번호를 확인해 주세요.")
-            row_idx = written + 1
-            for col, value in enumerate((order_id, "택배,등기,소포", "CJ대한통운", tracking)):
-                target.write(row_idx, col, value)
+            if not 8 <= len(tracking) <= 20:
+                raise ValueError(f"네이버 {source_row_number}행 송장번호를 확인해 주세요.")
+            # 원본 전체 주문 정보는 보존. 네이버 발송처리 필수 4개 열만 변경.
+            cells[idx["상품주문번호"]] = order_id
+            cells[idx["배송방법"]] = "택배,등기,소포"
+            cells[idx["택배사"]] = "CJ대한통운"
+            cells[idx["송장번호"]] = tracking
+            for col, value in enumerate(cells[:len(heading)]):
+                if value is None:
+                    continue
+                # 전화번호·주문번호처럼 긴 숫자는 엑셀 15자리 숫자 정밀도 손실을 막는다.
+                title = heading[col]
+                if col in (idx["상품주문번호"], idx["송장번호"]) or any(
+                    marker in title for marker in ("주문번호", "연락처", "전화번호", "우편번호", "송장번호", "상품번호", "묶음배송번호")
+                ):
+                    target.write(written + 1, col, str(value))
+                elif isinstance(value, (datetime, date)):
+                    target.write(written + 1, col, value, date_style)
+                elif isinstance(value, (str, int, float, bool)):
+                    target.write(written + 1, col, value)
+                else:
+                    target.write(written + 1, col, str(value))
             written += 1
         if written != len(expected_rows):
-            raise RuntimeError("네이버 발송처리 파일의 행 수가 원본 주문 건수와 다릅니다.")
+            raise RuntimeError("네이버 발송처리 파일의 주문행 수가 원본과 다릅니다.")
         output = io.BytesIO()
         result_book.save(output)
         payload = output.getvalue()
         if not payload.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
-            raise RuntimeError(".xls 생성 결과가 올바른 Excel 97-2003 형식이 아닙니다.")
+            raise RuntimeError("XLS 파일 생성에 실패했습니다.")
         return payload
     finally:
         source.close()
 
-
 def make_shipment_zip(files, yyyymmdd):
-    """파일 순서 무관. 네이버는 일괄발송용 xls, 쿠팡은 xlsx를 ZIP으로 반환."""
+    """파일 순서 무관. 네이버는 주문원본까지 담은 일괄발송용 xls, 쿠팡은 xlsx를 ZIP으로 반환."""
     import zipfile
     if len(files) != 4:
         raise ValueError(f"파일 4개가 필요합니다. 현재 {len(files)}개입니다.")
@@ -1688,6 +1733,16 @@ def parse_uploaded_file_cached(filename, content):
     else:
         raw = read_excel_file(file_like)
     market = detect_market(filename, raw)
+    if market == "네이버":
+        necessary = ["상품주문번호", "수취인명", "수량", "결제일"]
+        missing = [name for name in necessary if name not in raw.columns]
+        if missing:
+            raise ValueError(
+                "이 네이버 완성 파일은 주문 분석용 원본 정보가 없는 구형 발송처리 파일입니다. "
+                "고객/상품 데이터를 복원할 수 없어 분석할 수 없습니다. "
+                "송장 업무 탭에서 원본 4개 파일로 다시 생성해 주세요. "
+                "부족한 열: " + ", ".join(missing)
+            )
     std = standardize(raw, market, filename)
     return std, market, len(raw)
 
@@ -1699,6 +1754,9 @@ def _prepare_uploaded_files(file_blobs):
     frames, errors, logs = [], [], []
     seen_digests = set()
     for filename, content in file_blobs:
+        # V30 이후 ★네이버 완성 파일은 주문 원본 72열도 포함해 CRM 분석 가능.
+        # 구버전 V28/V29에서 이미 만든 4열 전용 파일은 고객정보가 없어 복구 불가능.
+        short_name = str(filename).strip()
         digest = hashlib.sha256(content).digest()
         if digest in seen_digests:
             logs.append({"파일명": filename, "채널": "", "원본행": 0,
@@ -2492,7 +2550,7 @@ _GUIDE = {
             ("🛡️", "일치 검사", "이름·전화번호·주소·상품·수량이 일치하는지 확인합니다. 불일치 시 완성 파일을 만들지 않습니다."),
             ("📦", "한 번에 다운로드", "검사에 통과하면 버튼으로 ZIP 한 개를 받아 ★네이버 완성 / ★쿠팡 완성 두 파일을 꺼냅니다."),
         ],
-        "tips": ["상단 '1행 제거' 기능과 하단 '4개 자동 매칭' 기능은 별개입니다.", "네이버 최종 파일은 발송처리 시트와 필수 4개 열만 가진 암호 없는 .xls입니다. 네이버에 업로드한 다음 반드시 일괄 발송처리를 클릭하세요.", "ZIP 안의 송장번호를 최종 확인하세요. 파일은 고객·주문 DB에 자동 저장되지 않습니다."],
+        "tips": ["상단 '1행 제거' 기능과 하단 '4개 자동 매칭' 기능은 별개입니다.", "네이버 최종 파일은 발송처리 시트와 주문정보까지 보존한 암호 없는 .xls입니다. 네이버에 업로드한 다음 반드시 일괄 발송처리를 클릭하세요.", "ZIP 안의 송장번호를 최종 확인하세요. 파일은 고객·주문 DB에 자동 저장되지 않습니다."],
     },
     "🔥 오늘 주문 분석": {
         "intro": "오늘 올린 주문에서 신규·재구매·VIP·주의 고객과 품목별 출고를 확인합니다.",
@@ -2850,7 +2908,7 @@ with tab_shipping:
                         if len(problems) > 35:
                             st.caption(f"그 외 {len(problems)-35:,}건은 파일 재확인이 필요합니다.")
                 else:
-                    st.success("✅ 두 플랫폼 모두 검증 완료. 네이버는 발송처리 전용 .xls(암호 없음), 쿠팡은 원본 형식 .xlsx로 만들었습니다.")
+                    st.success("✅ 두 플랫폼 모두 검증 완료. 네이버는 주문원본 열을 보존한 발송처리 .xls(암호 없음), 쿠팡은 원본 형식 .xlsx로 만들었습니다.")
                     st.download_button(
                         "📦 ★네이버 + ★쿠팡 완성 파일 2개 한 번에 저장",
                         data=zip_bytes,
