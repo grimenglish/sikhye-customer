@@ -2549,8 +2549,9 @@ _GUIDE = {
             ("📥", "4개 파일 넣기", "하단에 네이버 주문, 쿠팡 주문, 네이버 CJ 송장, 쿠팡 CJ 송장 엑셀 4개를 순서 상관없이 올립니다."),
             ("🛡️", "일치 검사", "이름·전화번호·주소·상품·수량이 일치하는지 확인합니다. 불일치 시 완성 파일을 만들지 않습니다."),
             ("📦", "한 번에 다운로드", "검사에 통과하면 버튼으로 ZIP 한 개를 받아 ★네이버 완성 / ★쿠팡 완성 두 파일을 꺼냅니다."),
+            ("➡️", "첫 페이지로 자동 전달", "바로 아래 자동 전달 버튼을 누르면 파일 재업로드 없이 재구매 분석에 사용할 수 있습니다."),
         ],
-        "tips": ["상단 '1행 제거' 기능과 하단 '4개 자동 매칭' 기능은 별개입니다.", "네이버 최종 파일은 발송처리 시트와 주문정보까지 보존한 암호 없는 .xls입니다. 네이버에 업로드한 다음 반드시 일괄 발송처리를 클릭하세요.", "ZIP 안의 송장번호를 최종 확인하세요. 파일은 고객·주문 DB에 자동 저장되지 않습니다."],
+        "tips": ["상단 '1행 제거' 기능과 하단 '4개 자동 매칭' 기능은 별개입니다.", "네이버 최종 파일은 발송처리 시트와 주문정보까지 보존한 암호 없는 .xls입니다. 네이버에 업로드한 다음 반드시 일괄 발송처리를 클릭하세요.", "ZIP 안의 송장번호를 최종 확인하세요. 첫 페이지 자동 전달 후에도 주문 DB는 직접 저장 버튼을 눌러야 반영됩니다."],
     },
     "🔥 오늘 주문 분석": {
         "intro": "오늘 올린 주문에서 신규·재구매·VIP·주의 고객과 품목별 출고를 확인합니다.",
@@ -2746,13 +2747,25 @@ with tab_upload:
         help="쿠팡 DeliveryList, 네이버 스마트스토어 엑셀을 여러 개 동시에 올릴 수 있습니다.",
         key=f"crm_excel_uploader_v21_{st.session_state.get('_upload_widget_version_v21', 0)}",
     )
+    # 송장업무에서 직접 전달한 완성 파일은 업로드 위젯을 조작하지 않고 세션 내에서 읽는다.
+    transferred = st.session_state.get("_shipping_to_crm_v31")
+    if transferred:
+        st.success("✅ 송장 업무에서 완성한 네이버·쿠팡 파일 2개가 자동으로 전달됐습니다. 다시 업로드하지 않아도 됩니다.")
+        st.caption("아래 고객·주문 분석은 전달한 완성 파일 기준입니다. DB에는 'DB에 저장하기'를 눌러야 반영됩니다.")
+        if uploaded_files:
+            st.info("직접 선택한 엑셀보다 송장 업무에서 전달한 최종 파일 2개를 우선 분석합니다.")
+        if st.button("↩️ 자동 전달 파일 해제하고 직접 업로드 사용", key="clear_shipping_transfer_v31"):
+            st.session_state.pop("_shipping_to_crm_v31", None)
+            st.session_state.pop("_upload_analysis_signature_v21", None)
+            st.rerun()
 
 if tab_upload.open:
     with tab_upload:
-        if uploaded_files:
-            # Streamlit은 위젯 변경 시 스크립트를 재실행한다. 동일 업로드 파일은 분석결과를 재사용한다.
+        transferred = st.session_state.get("_shipping_to_crm_v31")
+        if transferred or uploaded_files:
+            # 송장 탭에서 버튼으로 전달하면 네이버 XLS와 쿠팡 XLSX가 곧바로 이 분석 경로를 사용한다.
             import hashlib
-            blobs = tuple((f.name, f.getvalue()) for f in uploaded_files)
+            blobs = tuple(transferred) if transferred else tuple((f.name, f.getvalue()) for f in uploaded_files)
             signature = tuple((name, len(content), hashlib.sha256(content).hexdigest())
                               for name, content in blobs)
             with st.spinner("엑셀 주문 내역을 분석하는 중입니다. 같은 파일은 다시 계산하지 않습니다..."):
@@ -2830,6 +2843,7 @@ if tab_upload.open:
                         st.session_state["today_customer_analysis"] = pd.DataFrame()
                         st.session_state["today_detail_analysis"] = pd.DataFrame()
                         st.session_state.pop("_upload_analysis_signature_v21", None)
+                        st.session_state.pop("_shipping_to_crm_v31", None)
                         st.session_state["_upload_widget_version_v21"] = st.session_state.get("_upload_widget_version_v21", 0) + 1
                         st.rerun()
         elif not st.session_state.get("today_raw_orders", pd.DataFrame()).empty:
@@ -2918,6 +2932,33 @@ with tab_shipping:
                         key="ship_zip_download_v26",
                     )
                     st.caption(f"한 번 클릭하면 ZIP이 다운로드됩니다. 압축을 풀면 **★네이버 완성({datecode}).xls**, **★쿠팡 완성({datecode}).xlsx** 두 파일이 나옵니다.")
+                    st.markdown("#### 📊 고객 재구매 분석으로 바로 넘기기")
+                    if st.button("➡️ 완성 파일 2개를 첫 페이지 고객 분석으로 전달", type="primary",
+                                 use_container_width=True, key="ship_to_crm_v31"):
+                        # 다운로드 파일의 실제 원본 바이트를 전달한다. 위젯 상태를 위조하지 않는다.
+                        import zipfile
+                        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as finished_zip:
+                            names = finished_zip.namelist()
+                            naver_names = [n for n in names if n.startswith("★네이버 완성(") and n.endswith(".xls")]
+                            coupang_names = [n for n in names if n.startswith("★쿠팡 완성(") and n.endswith(".xlsx")]
+                            if len(names) != 2 or len(naver_names) != 1 or len(coupang_names) != 1:
+                                st.error("완성 파일 2개를 확인할 수 없어 전달하지 않았습니다.")
+                            else:
+                                transfer = tuple((n, finished_zip.read(n)) for n in (naver_names[0], coupang_names[0]))
+                                raw_check, order_check, logs_check, errors_check = _prepare_uploaded_files(transfer)
+                                good = sum(x.get("상태") == "성공" for x in logs_check)
+                                if errors_check or good != 2 or raw_check.empty or order_check.empty:
+                                    st.error("첫 페이지 분석 형식 검증에 실패해 전달하지 않았습니다.")
+                                    for fname, message in errors_check:
+                                        st.warning(f"{fname}: {message}")
+                                else:
+                                    # 임시 세션 메모리에만 보관. Supabase에는 사용자가 명시적으로 저장할 때만 반영.
+                                    st.session_state["_shipping_to_crm_v31"] = transfer
+                                    st.session_state.pop("_upload_analysis_signature_v21", None)
+                                    st.success(f"✅ 네이버·쿠팡 완성 파일 2개 전달 성공! 주문 {len(order_check):,}건이 준비됐습니다. "
+                                               "상단 '⬆️ 엑셀 업로드' 탭을 열면 자동 분석되며, DB 저장은 별도로 눌러주세요.")
+                    if st.session_state.get("_shipping_to_crm_v31"):
+                        st.info("📌 완성 파일이 첫 페이지에 준비되어 있습니다. 상단 '⬆️ 엑셀 업로드' 탭에서 고객 재구매 분석을 확인하세요.")
             except Exception as exc:
                 st.session_state.pop("_ship_v26_signature", None)
                 st.session_state.pop("_ship_v26_result", None)
